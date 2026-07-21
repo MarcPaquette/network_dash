@@ -1,0 +1,104 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+# Least privilege by default; the publish job opts into write below.
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: Build ${{ matrix.artifact }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Universal macOS binary (Apple Silicon + Intel), built natively on
+          # the free arm64 runner and combined with lipo — no cross-compiling
+          # of aws-lc-sys.
+          - artifact: macos-universal
+            os: macos-latest
+            targets: aarch64-apple-darwin,x86_64-apple-darwin
+          - artifact: x86_64-linux
+            os: ubuntu-latest
+            targets: x86_64-unknown-linux-gnu
+          - artifact: aarch64-linux
+            os: ubuntu-24.04-arm
+            targets: aarch64-unknown-linux-gnu
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.targets }}
+
+      - name: Cache cargo registry & build
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.artifact }}
+
+      - name: Build & package
+        shell: bash
+        run: |
+          set -euo pipefail
+          bin=network_dash
+          IFS=',' read -ra TARGETS <<< "${{ matrix.targets }}"
+          for t in "${TARGETS[@]}"; do
+            cargo build --release --locked --target "$t"
+          done
+
+          mkdir -p out
+          if [ "${#TARGETS[@]}" -gt 1 ]; then
+            # Combine the per-arch macOS builds into one universal binary.
+            paths=()
+            for t in "${TARGETS[@]}"; do paths+=("target/$t/release/$bin"); done
+            lipo -create -output "out/$bin" "${paths[@]}"
+          else
+            cp "target/${TARGETS[0]}/release/$bin" "out/$bin"
+          fi
+
+          stage="$bin-${GITHUB_REF_NAME}-${{ matrix.artifact }}"
+          mkdir "$stage"
+          cp "out/$bin" "$stage/"
+          cp README.md "$stage/"
+          tar czf "$stage.tar.gz" "$stage"
+          shasum -a 256 "$stage.tar.gz" > "$stage.tar.gz.sha256"
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: |
+            *.tar.gz
+            *.tar.gz.sha256
+          if-no-files-found: error
+
+  release:
+    name: Publish GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          # Tags like v1.0.0-rc1 / v0.0.0-test become pre-releases.
+          prerelease: ${{ contains(github.ref_name, '-') }}
