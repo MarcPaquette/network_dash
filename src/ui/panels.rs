@@ -8,7 +8,7 @@ use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph, Sparkline};
+use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph};
 
 use crate::app::AppState;
 use crate::metrics::MetricId;
@@ -124,10 +124,7 @@ pub fn latency(frame: &mut Frame, area: Rect, state: &AppState) {
     let Some((name, t)) = state.targets.iter().next() else {
         return;
     };
-    let rows = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Length(1), Constraint::Min(0)])
-        .split(inner);
+    let (summary, chart) = summary_and_chart(inner, 1);
 
     let cur = t.latency_ms.latest().unwrap_or(0.0);
     let avg = t.latency_ms.mean().unwrap_or(0.0);
@@ -136,18 +133,25 @@ pub fn latency(frame: &mut Frame, area: Rect, state: &AppState) {
     let stat = Line::from(format!(
         "{name}  cur {cur:.0}ms  avg {avg:.0}ms  max {max:.0}ms  jitter {jit:.0}ms"
     ));
-    frame.render_widget(Paragraph::new(stat), rows[0]);
+    frame.render_widget(Paragraph::new(stat), summary);
 
-    let data: Vec<u64> = t
-        .latency_ms
-        .values()
-        .iter()
-        .map(|v| v.round() as u64)
-        .collect();
-    let spark = Sparkline::default()
-        .data(data)
-        .style(Style::default().fg(state.theme.accent));
-    frame.render_widget(spark, rows[1]);
+    if let Some(area) = chart {
+        let series = vec![LineSeries::from_values(
+            name.clone(),
+            state.theme.accent,
+            &t.latency_ms.values(),
+        )];
+        let (x_max, y_max) = chart_bounds(&series, 20.0); // at least 0–20ms
+        frame.render_widget(
+            line_chart(
+                &series,
+                x_max,
+                [0.0, y_max],
+                vec!["0".into(), format!("{y_max:.0}ms")],
+            ),
+            area,
+        );
+    }
 }
 
 /// Packet-loss panel: one line per target with its loss %.
@@ -512,6 +516,29 @@ mod tests {
             .any(|c| ('\u{2800}'..='\u{28FF}').contains(&c))
     }
 
+    /// The x of the rightmost cell holding a plotted-graph glyph — braille (line chart) or
+    /// block bar (sparkline) — anywhere in the buffer, or `None` if nothing was plotted.
+    /// Used to check a chart spans the full width of its panel rather than underfilling it.
+    fn rightmost_graph_column(term: &Terminal<TestBackend>) -> Option<u16> {
+        let buf = term.backend().buffer();
+        let area = *buf.area();
+        let is_graph = |s: &str| {
+            s.chars().any(|c| {
+                ('\u{2800}'..='\u{28FF}').contains(&c)   // braille (line_chart)
+                    || ('\u{2581}'..='\u{2588}').contains(&c) // block bars (sparkline)
+            })
+        };
+        let mut rightmost = None;
+        for y in 0..area.height {
+            for x in 0..area.width {
+                if is_graph(buf[(x, y)].symbol()) {
+                    rightmost = Some(rightmost.map_or(x, |r: u16| r.max(x)));
+                }
+            }
+        }
+        rightmost
+    }
+
     #[test]
     fn loss_panel_draws_line_graph() {
         let mut state = test_state();
@@ -567,6 +594,32 @@ mod tests {
         assert!(
             has_braille(&term),
             "throughput panel should draw a line graph"
+        );
+    }
+
+    #[test]
+    fn latency_panel_graph_spans_full_width() {
+        let mut state = test_state();
+        let now = Utc.with_ymd_and_hms(2026, 7, 20, 14, 0, 0).unwrap();
+        // A handful of points — far fewer than the panel is wide. A left-aligned sparkline
+        // would fill only the first few columns; a line chart spans the whole frame.
+        for ms in [10.0, 40.0, 25.0, 60.0, 30.0, 45.0] {
+            state.apply_sample(
+                now,
+                Sample::Latency {
+                    target: "1.1.1.1".into(),
+                    rtt_ms: Some(ms),
+                },
+            );
+        }
+        let width = 60u16;
+        let mut term = Terminal::new(TestBackend::new(width, 16)).unwrap();
+        term.draw(|f| latency(f, f.area(), &state)).unwrap();
+
+        let rightmost = rightmost_graph_column(&term).expect("latency graph should render");
+        assert!(
+            rightmost >= width - 4,
+            "latency graph stops at column {rightmost} of {width}; it should span the frame"
         );
     }
 
