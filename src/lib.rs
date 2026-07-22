@@ -5,6 +5,7 @@
 
 pub mod app;
 pub mod config;
+pub mod diagnosis;
 pub mod event;
 pub mod health;
 pub mod history;

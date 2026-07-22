@@ -8,9 +8,10 @@ use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph};
+use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph};
 
 use crate::app::AppState;
+use crate::health::Health;
 use crate::metrics::MetricId;
 use crate::ui::theme;
 use crate::ui::widgets::{LineSeries, line_chart, metric_block};
@@ -47,6 +48,7 @@ pub fn render(frame: &mut Frame, state: &AppState) {
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(3), // header
+            Constraint::Length(5), // diagnosis: what's wrong (worst-first verdicts)
             Constraint::Length(4), // detail band: link | routing (2 content rows + border)
             Constraint::Min(0),    // metric grid (2×2 charts)
             Constraint::Length(6), // events
@@ -55,9 +57,10 @@ pub fn render(frame: &mut Frame, state: &AppState) {
         .split(frame.area());
 
     header(frame, root[0], state);
+    diagnosis(frame, root[1], state);
 
     // Detail band — two compact, text-only panels side by side.
-    let detail = halves(root[1]);
+    let detail = halves(root[2]);
     link(frame, detail[0], state);
     routing(frame, detail[1], state);
 
@@ -65,7 +68,7 @@ pub fn render(frame: &mut Frame, state: &AppState) {
     let bands = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
-        .split(root[2]);
+        .split(root[3]);
     let top = halves(bands[0]);
     let bottom = halves(bands[1]);
 
@@ -75,8 +78,47 @@ pub fn render(frame: &mut Frame, state: &AppState) {
     loss(frame, bottom[0], state);
     throughput(frame, bottom[1], state);
 
-    events(frame, root[3], state);
-    footer(frame, root[4], state);
+    events(frame, root[4], state);
+    footer(frame, root[5], state);
+
+    // The help overlay draws on top of everything when toggled.
+    if state.show_help {
+        help_overlay(frame, frame.area(), state);
+    }
+}
+
+/// A centered rectangle of at most `width`×`height` within `area`.
+fn centered_rect(area: Rect, width: u16, height: u16) -> Rect {
+    let w = width.min(area.width);
+    let h = height.min(area.height);
+    Rect {
+        x: area.x + (area.width - w) / 2,
+        y: area.y + (area.height - h) / 2,
+        width: w,
+        height: h,
+    }
+}
+
+/// Keybinding help, drawn as a centered overlay (toggled with `?`).
+pub fn help_overlay(frame: &mut Frame, area: Rect, state: &AppState) {
+    let rows = [
+        "q / Esc     quit",
+        "p           pause / resume",
+        "r           force refresh",
+        "c           clear events",
+        "t           cycle theme",
+        "↑ / ↓  k/j  scroll events",
+        "PgUp/PgDn   page events",
+        "?           toggle this help",
+    ];
+    let rect = centered_rect(area, 34, rows.len() as u16 + 2);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(" HELP ")
+        .border_style(Style::default().fg(state.theme.accent));
+    let lines: Vec<Line> = rows.iter().map(|r| Line::from(*r)).collect();
+    frame.render_widget(Clear, rect);
+    frame.render_widget(Paragraph::new(lines).block(block), rect);
 }
 
 fn halves(area: Rect) -> std::rc::Rc<[Rect]> {
@@ -86,11 +128,11 @@ fn halves(area: Rect) -> std::rc::Rc<[Rect]> {
         .split(area)
 }
 
-/// Header banner: app name, overall health, and status fields.
+/// Header banner: app name, overall health, the top verdict, and status fields.
 pub fn header(frame: &mut Frame, area: Rect, state: &AppState) {
     let overall = state.overall_health();
     let color = state.theme.health_color(overall);
-    let line = Line::from(vec![
+    let mut spans = vec![
         Span::styled("NetPulse", Style::default().fg(state.theme.accent).bold()),
         Span::raw("  "),
         Span::styled(
@@ -102,13 +144,61 @@ pub fn header(frame: &mut Frame, area: Rect, state: &AppState) {
             theme::health_label(overall),
             Style::default().fg(color).bold(),
         ),
-        Span::raw(format!("   targets: {}", state.targets.len())),
-        Span::raw(if state.paused { "   [PAUSED]" } else { "" }),
-    ]);
+    ];
+    // Name the culprit inline when there is one, so the header says *what* — not just *that*.
+    if let Some(top) = crate::diagnosis::diagnose(state).first()
+        && top.severity > Health::Ok
+    {
+        spans.push(Span::raw("  "));
+        spans.push(Span::styled(
+            top.headline.clone(),
+            Style::default().fg(color).bold(),
+        ));
+    }
+    spans.push(Span::raw(format!("   targets: {}", state.targets.len())));
+    if let Some(ip) = &state.public_ip {
+        spans.push(Span::raw(format!("   wan {ip}")));
+    }
+    spans.push(Span::raw(if state.paused { "   [PAUSED]" } else { "" }));
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(state.theme.border_style(overall));
-    frame.render_widget(Paragraph::new(line).block(block), area);
+    frame.render_widget(Paragraph::new(Line::from(spans)).block(block), area);
+}
+
+/// Top "what's wrong" panel: the worst-first, localized verdicts from the diagnosis engine.
+/// This is the at-a-glance answer — the border and each verdict carry the health color, and
+/// the healthy state renders a single "No problems detected" line.
+pub fn diagnosis(frame: &mut Frame, area: Rect, state: &AppState) {
+    let verdicts = crate::diagnosis::diagnose(state);
+    let worst = verdicts.first().map_or(Health::Ok, |d| d.severity);
+    let block = metric_block("DIAGNOSIS", worst, &state.theme);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let items: Vec<ListItem> = verdicts
+        .iter()
+        .take(inner.height as usize)
+        .map(|d| {
+            let color = state.theme.health_color(d.severity);
+            let tag = d.layer.map_or("OK", |l| l.tag());
+            let mut spans = vec![
+                Span::styled(theme::health_symbol(d.severity), Style::default().fg(color)),
+                Span::raw(" "),
+                Span::styled(format!("[{tag}]"), Style::default().fg(color).bold()),
+                Span::raw(" "),
+                Span::raw(d.headline.clone()),
+            ];
+            if let Some(ev) = d.evidence.first() {
+                spans.push(Span::styled(
+                    format!("  ({ev})"),
+                    Style::default().fg(state.theme.muted),
+                ));
+            }
+            ListItem::new(Line::from(spans))
+        })
+        .collect();
+    frame.render_widget(List::new(items), inner);
 }
 
 /// Latency & jitter panel: sparkline + stats for the first internet target.
@@ -293,6 +383,24 @@ pub fn link(frame: &mut Frame, area: Rect, state: &AppState) {
         .map(|v| format!("{v:.0} dBm"))
         .unwrap_or_else(|| "—".into());
 
+    // Signal quality (SNR) and negotiated rate — the clearest "Wi-Fi is slow" signals.
+    let mut wifi_parts = vec![format!("WiFi  {ssid}"), rssi];
+    if let (Some(r), Some(n)) = (state.link.rssi_dbm, state.link.noise_dbm) {
+        wifi_parts.push(format!("SNR {:.0} dB", r - n));
+    }
+    if let Some(tx) = state.link.tx_rate {
+        wifi_parts.push(format!("{tx:.0} Mbps"));
+    }
+    if let Some(iface) = &state.interface {
+        wifi_parts.push(iface.clone());
+    }
+    if let Some(mtu) = state.mtu {
+        wifi_parts.push(format!("MTU {mtu}"));
+    }
+    if state.vpn {
+        wifi_parts.push("VPN".into());
+    }
+
     // Endpoint checklist packed onto a single line to fit the compact band.
     let mut spans = Vec::new();
     for (endpoint, r) in &state.reachability {
@@ -306,10 +414,7 @@ pub fn link(frame: &mut Frame, area: Rect, state: &AppState) {
         spans.push(Span::raw("  "));
     }
 
-    let lines = vec![
-        Line::from(format!("WiFi  {ssid}   {rssi}")),
-        Line::from(spans),
-    ];
+    let lines = vec![Line::from(wifi_parts.join("   ")), Line::from(spans)];
     frame.render_widget(Paragraph::new(lines), inner);
 }
 
@@ -341,8 +446,22 @@ pub fn routing(frame: &mut Frame, area: Rect, state: &AppState) {
     } else {
         ("stable", state.theme.ok)
     };
+    // Per-hop detail: the path RTT when reachable, or where it dies when not.
+    let hop_info = if r.reachable {
+        r.detail
+            .last()
+            .and_then(|h| h.min_rtt_ms)
+            .map(|ms| format!("  {ms:.0}ms"))
+            .unwrap_or_default()
+    } else {
+        r.detail
+            .iter()
+            .rposition(|h| h.addr != "*")
+            .map(|i| format!("  stops @ hop {} ({})", i + 1, r.detail[i].addr))
+            .unwrap_or_default()
+    };
     let lines = vec![
-        Line::from(format!("hops: {}", r.hops)),
+        Line::from(format!("hops: {}{}", r.hops, hop_info)),
         Line::from(vec![
             Span::raw("path: "),
             Span::styled(status, Style::default().fg(color)),
@@ -378,6 +497,14 @@ pub fn throughput(frame: &mut Frame, area: Rect, state: &AppState) {
         .last_mbps
         .map(|m| format!("{m:.0} Mbps"))
         .unwrap_or_else(|| "—".into());
+    // Append the bufferbloat delta (added latency under load) when measured.
+    let probe_line = match (
+        state.throughput.idle_latency_ms,
+        state.throughput.loaded_latency_ms,
+    ) {
+        (Some(i), Some(l)) => format!("probe: {probe}   load +{:.0}ms", (l - i).max(0.0)),
+        _ => format!("probe: {probe}"),
+    };
     let (summary, chart) = summary_and_chart(inner, 3);
     let lines = vec![
         Line::from(vec![
@@ -388,7 +515,7 @@ pub fn throughput(frame: &mut Frame, area: Rect, state: &AppState) {
             Span::styled("▲ tx ", Style::default().fg(state.theme.tx)),
             Span::raw(human_rate(tx)),
         ]),
-        Line::from(format!("probe: {probe}")),
+        Line::from(probe_line),
     ];
     frame.render_widget(Paragraph::new(lines), summary);
 
@@ -436,10 +563,11 @@ pub fn events(frame: &mut Frame, area: Rect, state: &AppState) {
     let items: Vec<ListItem> = state
         .events
         .iter()
+        .skip(state.events_scroll)
         .take(inner.height as usize)
         .map(|inc| {
             let color = state.theme.health_color(inc.severity);
-            ListItem::new(Line::from(vec![
+            let mut spans = vec![
                 Span::styled(
                     inc.ts.format("%H:%M:%S").to_string(),
                     Style::default().fg(state.theme.muted),
@@ -451,7 +579,15 @@ pub fn events(frame: &mut Frame, area: Rect, state: &AppState) {
                 ),
                 Span::raw(" "),
                 Span::raw(inc.message.clone()),
-            ]))
+            ];
+            // Surface the threshold that was crossed — logged but previously never shown.
+            if let Some(thr) = inc.threshold {
+                spans.push(Span::styled(
+                    format!("  · thr {thr:.0}{}", inc.unit),
+                    Style::default().fg(state.theme.muted),
+                ));
+            }
+            ListItem::new(Line::from(spans))
         })
         .collect();
     let content = if items.is_empty() {
@@ -479,7 +615,7 @@ mod tests {
     use super::*;
     use crate::config::Config;
     use crate::health::Health;
-    use crate::metrics::Sample;
+    use crate::metrics::{Hop, Sample};
     use crate::ui::theme::Theme;
     use chrono::{TimeZone, Utc};
     use ratatui::Terminal;
@@ -630,11 +766,116 @@ mod tests {
         term.draw(|f| render(f, &state)).unwrap();
         let text = buffer_text(&term);
         assert!(text.contains("NetPulse"));
+        assert!(text.contains("DIAGNOSIS"));
         assert!(text.contains("LATENCY & JITTER"));
         assert!(text.contains("PACKET LOSS"));
         assert!(text.contains("DNS HEALTH"));
         assert!(text.contains("THROUGHPUT"));
         assert!(text.contains("EVENTS"));
+    }
+
+    /// Drive a state into a "system resolver failing, public resolvers fine, connectivity OK"
+    /// condition — the classic DNS-config problem the diagnosis engine should name.
+    fn dns_problem_state() -> AppState {
+        let mut c = Config::default();
+        c.targets.internet = vec!["1.1.1.1".into()];
+        c.targets.gateway = Some("192.168.1.1".into());
+        c.targets.gateway_auto = false;
+        c.thresholds.debounce_samples = 1;
+        let mut state = AppState::new(c);
+        let now = Utc.with_ymd_and_hms(2026, 7, 22, 12, 0, 0).unwrap();
+        for _ in 0..2 {
+            state.apply_sample(
+                now,
+                Sample::Latency {
+                    target: "192.168.1.1".into(),
+                    rtt_ms: Some(3.0),
+                },
+            );
+            state.apply_sample(
+                now,
+                Sample::Latency {
+                    target: "1.1.1.1".into(),
+                    rtt_ms: Some(20.0),
+                },
+            );
+            state.apply_sample(
+                now,
+                Sample::Dns {
+                    resolver: "system".into(),
+                    latency_ms: None,
+                },
+            );
+            state.apply_sample(
+                now,
+                Sample::Dns {
+                    resolver: "cloudflare".into(),
+                    latency_ms: Some(15.0),
+                },
+            );
+            state.apply_sample(
+                now,
+                Sample::Dns {
+                    resolver: "google".into(),
+                    latency_ms: Some(18.0),
+                },
+            );
+        }
+        state
+    }
+
+    #[test]
+    fn diagnosis_panel_names_the_problem() {
+        let state = dns_problem_state();
+        let mut term = Terminal::new(TestBackend::new(120, 8)).unwrap();
+        term.draw(|f| diagnosis(f, f.area(), &state)).unwrap();
+        let text = buffer_text(&term);
+        assert!(text.contains("DIAGNOSIS"), "panel title missing: {text}");
+        assert!(text.contains("DNS"), "should name the DNS layer: {text}");
+        assert!(
+            text.to_lowercase().contains("configured") || text.to_lowercase().contains("public"),
+            "should describe the configured-DNS problem: {text}"
+        );
+    }
+
+    #[test]
+    fn diagnosis_panel_border_goes_red_on_a_crit_problem() {
+        let state = dns_problem_state(); // failed lookup => Crit
+        let mut term = Terminal::new(TestBackend::new(120, 8)).unwrap();
+        term.draw(|f| diagnosis(f, f.area(), &state)).unwrap();
+        let buf = term.backend().buffer();
+        let crit = Theme::default().crit;
+        // The top-left border corner carries the panel's health color.
+        assert_eq!(
+            buf[(0, 0)].fg,
+            crit,
+            "crit diagnosis should paint the border red"
+        );
+    }
+
+    #[test]
+    fn diagnosis_panel_healthy_reports_no_problems() {
+        let state = test_state();
+        let mut term = Terminal::new(TestBackend::new(120, 8)).unwrap();
+        term.draw(|f| diagnosis(f, f.area(), &state)).unwrap();
+        let text = buffer_text(&term);
+        assert!(
+            text.contains("No problems detected"),
+            "healthy state should say so: {text}"
+        );
+    }
+
+    #[test]
+    fn header_appends_the_top_verdict() {
+        let state = dns_problem_state();
+        let mut term = Terminal::new(TestBackend::new(180, 3)).unwrap();
+        term.draw(|f| header(f, f.area(), &state)).unwrap();
+        let text = buffer_text(&term);
+        assert!(text.contains("NetPulse"), "header identity: {text}");
+        assert!(
+            text.to_lowercase().contains("dns"),
+            "header should name the culprit, not just the severity word: {text}"
+        );
     }
 
     #[test]
@@ -644,9 +885,10 @@ mod tests {
         term.draw(|f| render(f, &state)).unwrap();
         let buf = term.backend().buffer();
         let area = *buf.area();
-        // Text of just the top band region: header (3 rows) + detail band (4 rows).
+        // Text of the detail band region: header (3) + diagnosis (5) = rows 0..8, then the
+        // link | routing detail band (4 rows) at rows 8..12.
         let mut band = String::new();
-        for y in 0..7 {
+        for y in 8..12 {
             for x in 0..area.width {
                 band.push_str(buf[(x, y)].symbol());
             }
@@ -672,6 +914,68 @@ mod tests {
         ] {
             assert!(all.contains(title), "missing panel: {title}");
         }
+    }
+
+    #[test]
+    fn help_overlay_renders_when_toggled() {
+        let mut state = test_state();
+        state.show_help = true;
+        let mut term = Terminal::new(TestBackend::new(120, 40)).unwrap();
+        term.draw(|f| render(f, &state)).unwrap();
+        let text = buffer_text(&term);
+        assert!(text.contains("HELP"), "overlay title should show: {text}");
+        assert!(
+            text.contains("cycle theme"),
+            "overlay body should show keys"
+        );
+    }
+
+    #[test]
+    fn events_feed_shows_threshold_detail() {
+        let mut state = test_state();
+        let now = Utc.with_ymd_and_hms(2026, 7, 20, 14, 0, 0).unwrap();
+        // Drive a latency crit so an incident with a threshold is logged.
+        for _ in 0..3 {
+            state.apply_sample(
+                now,
+                Sample::Latency {
+                    target: "1.1.1.1".into(),
+                    rtt_ms: Some(500.0),
+                },
+            );
+        }
+        let mut term = Terminal::new(TestBackend::new(120, 8)).unwrap();
+        term.draw(|f| events(f, f.area(), &state)).unwrap();
+        assert!(
+            buffer_text(&term).contains("thr"),
+            "events should surface the crossed threshold"
+        );
+    }
+
+    #[test]
+    fn header_shows_public_ip_when_known() {
+        let mut state = test_state();
+        state.public_ip = Some("203.0.113.7".into());
+        let mut term = Terminal::new(TestBackend::new(120, 3)).unwrap();
+        term.draw(|f| header(f, f.area(), &state)).unwrap();
+        assert!(
+            buffer_text(&term).contains("wan 203.0.113.7"),
+            "header should show the WAN IP"
+        );
+    }
+
+    #[test]
+    fn link_panel_shows_interface_mtu_and_vpn() {
+        let mut state = test_state();
+        state.interface = Some("utun3".into());
+        state.mtu = Some(1400);
+        state.vpn = true;
+        let mut term = Terminal::new(TestBackend::new(80, 8)).unwrap();
+        term.draw(|f| link(f, f.area(), &state)).unwrap();
+        let text = buffer_text(&term);
+        assert!(text.contains("utun3"), "should show interface: {text}");
+        assert!(text.contains("MTU 1400"), "should show MTU: {text}");
+        assert!(text.contains("VPN"), "should badge VPN: {text}");
     }
 
     #[test]
@@ -751,6 +1055,8 @@ mod tests {
             now,
             Sample::Link {
                 rssi_dbm: Some(-45.0),
+                noise_dbm: Some(-90.0),
+                tx_rate: Some(866.0),
                 ssid: Some("MyNet".into()),
             },
         );
@@ -768,11 +1074,14 @@ mod tests {
                 ok: false,
             },
         );
-        let mut term = Terminal::new(TestBackend::new(40, 8)).unwrap();
+        let mut term = Terminal::new(TestBackend::new(60, 8)).unwrap();
         term.draw(|f| link(f, f.area(), &state)).unwrap();
         let text = buffer_text(&term);
         assert!(text.contains("MyNet"));
         assert!(text.contains("-45 dBm"));
+        // SNR (−45 − −90 = 45 dB) and negotiated rate are surfaced, not discarded.
+        assert!(text.contains("SNR 45 dB"), "should show SNR: {text}");
+        assert!(text.contains("866 Mbps"), "should show Tx rate: {text}");
         // Endpoints render together on a single compact row (band layout).
         let buf = term.backend().buffer();
         let area = *buf.area();
@@ -803,6 +1112,18 @@ mod tests {
                 hops: 8,
                 reachable: true,
                 changed: false,
+                detail: vec![
+                    Hop {
+                        addr: "192.168.1.1".into(),
+                        min_rtt_ms: Some(1.0),
+                        loss_pct: 0.0,
+                    },
+                    Hop {
+                        addr: "1.1.1.1".into(),
+                        min_rtt_ms: Some(12.0),
+                        loss_pct: 0.0,
+                    },
+                ],
             },
         );
         let mut term = Terminal::new(TestBackend::new(40, 8)).unwrap();
@@ -810,6 +1131,8 @@ mod tests {
         let text = buffer_text(&term);
         assert!(text.contains("hops: 8"), "text: {text}");
         assert!(text.contains("stable"));
+        // The final-hop RTT is surfaced now that we parse per-hop timings.
+        assert!(text.contains("12ms"), "should show final-hop RTT: {text}");
     }
 
     #[test]

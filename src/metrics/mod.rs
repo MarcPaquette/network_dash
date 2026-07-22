@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 pub mod dns;
 pub mod link;
 pub mod ping;
+pub mod pubip;
 pub mod reachability;
 pub mod routing;
 pub mod throughput;
@@ -60,21 +61,39 @@ pub enum Sample {
     Throughput { rx_bps: f64, tx_bps: f64 },
     /// Active capacity-probe result in Mbps.
     ThroughputProbe { mbps: f64 },
+    /// Latency measured while idle vs while the link is saturated (bufferbloat), in ms.
+    Bufferbloat { idle_ms: f64, loaded_ms: f64 },
     /// Reachability check for a named endpoint.
     Reachability { endpoint: String, ok: bool },
-    /// Wireless link reading: RSSI in dBm and current SSID.
+    /// Captive-portal detection result (a login page intercepting web traffic).
+    CaptivePortal { detected: bool },
+    /// The observed public/WAN IP address (for ISP/WAN-change detection).
+    PublicIp { ip: String },
+    /// Wireless link reading: RSSI/noise in dBm, negotiated Tx rate (Mbps), and current SSID.
     Link {
         rssi_dbm: Option<f64>,
+        noise_dbm: Option<f64>,
+        tx_rate: Option<f64>,
         ssid: Option<String>,
     },
-    /// Routing/path result for a target: hop count, reachability, and whether the path
-    /// changed since the last probe.
+    /// Routing/path result for a target: hop count, reachability, whether the path changed
+    /// since the last probe, and per-hop detail (address, best RTT, probe loss).
     Routing {
         target: String,
         hops: usize,
         reachable: bool,
         changed: bool,
+        detail: Vec<Hop>,
     },
+}
+
+/// One traceroute hop: its address (`"*"` if it never responded), the best RTT seen across
+/// the probes to it, and the fraction of probes lost (0–100).
+#[derive(Debug, Clone, PartialEq)]
+pub struct Hop {
+    pub addr: String,
+    pub min_rtt_ms: Option<f64>,
+    pub loss_pct: f64,
 }
 
 /// A source of [`Sample`]s. Each metric family is one probe, driven on its own cadence by
