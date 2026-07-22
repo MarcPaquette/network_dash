@@ -44,6 +44,10 @@ where
 {
     tokio::spawn(async move {
         let mut ticker = tokio::time::interval(interval);
+        // If a tick overruns (a slow probe), re-align to the cadence grid rather than
+        // replaying every missed tick back-to-back (the default `Burst`), which makes a
+        // panel go quiet and then jump instead of updating on regular intervals.
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             ticker.tick().await;
             for sample in probe.tick().await {
@@ -119,7 +123,7 @@ pub async fn run_once(config: Config) -> color_eyre::Result<()> {
     if let Ok(mut p) = crate::metrics::ping::PingProbe::new(&targets, Duration::from_millis(900)) {
         samples.extend(p.tick().await);
     }
-    let mut dns = crate::metrics::dns::DnsProbe::new(&config.resolvers);
+    let mut dns = crate::metrics::dns::DnsProbe::new(&config.resolvers, Duration::from_secs(2));
     samples.extend(dns.tick().await);
     let mut reach = crate::metrics::reachability::ReachabilityProbe::new(
         crate::metrics::reachability::ReachabilityProbe::default_endpoints(),
@@ -211,14 +215,13 @@ async fn run_inner(terminal: &mut crate::tui::Tui, config: Config) -> color_eyre
         _ => _handles.push(spawn_probe(DemoProbe::new(targets), interval, tx.clone())),
     }
 
-    // DNS resolver comparison.
-    let dns = crate::metrics::dns::DnsProbe::new(&config.resolvers);
+    // DNS resolver comparison. Bound each lookup well under the cadence so a slow or
+    // unreachable resolver can't stretch a tick past its interval and desync the panel.
+    let dns_interval = Duration::from_millis(config.cadence.dns_ms);
+    let dns_timeout = Duration::from_secs(2).min(dns_interval);
+    let dns = crate::metrics::dns::DnsProbe::new(&config.resolvers, dns_timeout);
     if dns.resolver_count() > 0 {
-        _handles.push(spawn_probe(
-            dns,
-            Duration::from_millis(config.cadence.dns_ms),
-            tx.clone(),
-        ));
+        _handles.push(spawn_probe(dns, dns_interval, tx.clone()));
     }
 
     // HTTP(S) reachability + captive/IPv6.
@@ -349,6 +352,63 @@ mod tests {
                 target: "gw".into(),
                 rtt_ms: Some(2.0)
             }
+        );
+    }
+
+    /// A probe whose first `tick` overruns the interval, then returns instantly. Used to
+    /// exercise the scheduler's missed-tick handling.
+    struct SlowFirstProbe {
+        first: bool,
+        overrun: Duration,
+    }
+
+    impl Probe for SlowFirstProbe {
+        fn tick(&mut self) -> impl Future<Output = Vec<Sample>> + Send {
+            let slow = std::mem::take(&mut self.first);
+            let overrun = self.overrun;
+            async move {
+                if slow {
+                    tokio::time::sleep(overrun).await;
+                }
+                vec![Sample::Latency {
+                    target: "x".into(),
+                    rtt_ms: Some(1.0),
+                }]
+            }
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn slow_tick_does_not_burst_missed_ticks() {
+        // The first tick blocks for 10 periods. With the default `Burst` behavior the
+        // scheduler would replay all ten missed ticks back-to-back at the same instant,
+        // so the panel goes quiet and then jumps — the reported symptom. The fix
+        // re-aligns to the cadence instead.
+        let period = Duration::from_millis(100);
+        let (tx, mut rx) = mpsc::channel(64);
+        let start = tokio::time::Instant::now();
+        let handle = spawn_probe(
+            SlowFirstProbe {
+                first: true,
+                overrun: period * 10,
+            },
+            period,
+            tx,
+        );
+
+        let mut stamps = Vec::new();
+        for _ in 0..6 {
+            rx.recv().await.unwrap();
+            stamps.push(start.elapsed());
+        }
+        handle.abort();
+
+        // Under a burst, all six samples land at ~t=10·period together. Re-aligned, the
+        // later samples are spread across subsequent periods.
+        let spread = stamps[5] - stamps[0];
+        assert!(
+            spread >= period * 3,
+            "samples bursted instead of spreading across the cadence: {stamps:?}"
         );
     }
 
