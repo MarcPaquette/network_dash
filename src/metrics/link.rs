@@ -68,16 +68,9 @@ pub struct WifiProbe;
 
 impl Probe for WifiProbe {
     async fn tick(&mut self) -> Vec<Sample> {
-        let info = tokio::task::spawn_blocking(|| {
-            let out = std::process::Command::new("system_profiler")
-                .arg("SPAirPortDataType")
-                .output()
-                .ok()?;
-            parse_airport(&String::from_utf8_lossy(&out.stdout))
-        })
-        .await
-        .ok()
-        .flatten();
+        let info = crate::metrics::proc::run_capture("system_profiler", &["SPAirPortDataType"])
+            .await
+            .and_then(|out| parse_airport(&out));
         match info {
             Some(w) => vec![Sample::Link {
                 rssi_dbm: w.rssi_dbm,

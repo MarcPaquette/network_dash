@@ -103,22 +103,17 @@ impl RoutingProbe {
 
 impl Probe for RoutingProbe {
     async fn tick(&mut self) -> Vec<Sample> {
-        let target = self.target.clone();
         let max = self.max_hops.to_string();
-        let out = tokio::task::spawn_blocking(move || {
-            std::process::Command::new("traceroute")
-                // -q 3: three probes per hop, so we get per-hop RTT and loss.
-                .args(["-n", "-w", "1", "-q", "3", "-m", &max, &target])
-                .output()
-                .ok()
-        })
-        .await
-        .ok()
-        .flatten();
+        let out = crate::metrics::proc::run_capture(
+            "traceroute",
+            // -q 3: three probes per hop, so we get per-hop RTT and loss.
+            &["-n", "-w", "1", "-q", "3", "-m", &max, self.target.as_str()],
+        )
+        .await;
         let Some(out) = out else {
             return vec![];
         };
-        let route = parse_traceroute(&String::from_utf8_lossy(&out.stdout), &self.target);
+        let route = parse_traceroute(&out, &self.target);
         let changed = self.prev_path.as_ref().is_some_and(|p| p != &route.path);
         self.prev_path = Some(route.path.clone());
         vec![Sample::Routing {
