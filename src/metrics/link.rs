@@ -81,6 +81,8 @@ impl Probe for WifiProbe {
         match info {
             Some(w) => vec![Sample::Link {
                 rssi_dbm: w.rssi_dbm,
+                noise_dbm: w.noise_dbm,
+                tx_rate: w.tx_rate,
                 ssid: w.ssid,
             }],
             None => vec![],
