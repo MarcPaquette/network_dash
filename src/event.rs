@@ -223,12 +223,12 @@ async fn run_inner(terminal: &mut crate::tui::Tui, config: Config) -> color_eyre
 
     // Real ICMP ping; fall back to the demo generator if a socket can't be created (so the
     // dashboard is still usable in restricted environments).
-    let mut _handles = Vec::new();
+    let mut handles = Vec::new();
     match crate::metrics::ping::PingProbe::new(&targets, timeout) {
         Ok(probe) if probe.target_count() > 0 => {
-            _handles.push(spawn_probe(probe, interval, tx.clone()));
+            handles.push(spawn_probe(probe, interval, tx.clone()));
         }
-        _ => _handles.push(spawn_probe(DemoProbe::new(targets), interval, tx.clone())),
+        _ => handles.push(spawn_probe(DemoProbe::new(targets), interval, tx.clone())),
     }
 
     // DNS resolver comparison. Bound each lookup well under the cadence so a slow or
@@ -237,11 +237,11 @@ async fn run_inner(terminal: &mut crate::tui::Tui, config: Config) -> color_eyre
     let dns_timeout = Duration::from_secs(2).min(dns_interval);
     let dns = crate::metrics::dns::DnsProbe::new(&config.resolvers, dns_timeout);
     if dns.resolver_count() > 0 {
-        _handles.push(spawn_probe(dns, dns_interval, tx.clone()));
+        handles.push(spawn_probe(dns, dns_interval, tx.clone()));
     }
 
     // HTTP(S) reachability + captive/IPv6.
-    _handles.push(spawn_probe(
+    handles.push(spawn_probe(
         crate::metrics::reachability::ReachabilityProbe::new(
             crate::metrics::reachability::ReachabilityProbe::default_endpoints(),
         ),
@@ -251,35 +251,35 @@ async fn run_inner(terminal: &mut crate::tui::Tui, config: Config) -> color_eyre
 
     // Passive throughput counters.
     let tput_interval = Duration::from_millis(config.cadence.throughput_passive_ms);
-    _handles.push(spawn_probe(
+    handles.push(spawn_probe(
         crate::metrics::throughput::ThroughputProbe::new(tput_interval),
         tput_interval,
         tx.clone(),
     ));
 
     // Active capacity probe (a bounded download on a slow cadence).
-    _handles.push(spawn_probe(
+    handles.push(spawn_probe(
         crate::metrics::throughput::CapacityProbe::new(config.throughput.probe_url.clone()),
         Duration::from_millis(config.cadence.throughput_probe_ms),
         tx.clone(),
     ));
 
     // Public/WAN IP (for ISP-change detection), on a slow cadence.
-    _handles.push(spawn_probe(
+    handles.push(spawn_probe(
         crate::metrics::pubip::PublicIpProbe::cloudflare(),
         Duration::from_millis(config.cadence.public_ip_ms),
         tx.clone(),
     ));
 
     // Wireless link (macOS system_profiler).
-    _handles.push(spawn_probe(
+    handles.push(spawn_probe(
         crate::metrics::link::WifiProbe,
         Duration::from_millis(config.cadence.link_ms),
         tx.clone(),
     ));
 
     // Routing / path (lightweight traceroute).
-    _handles.push(spawn_probe(
+    handles.push(spawn_probe(
         crate::metrics::routing::RoutingProbe::new(config.targets.routing_target.clone(), 15),
         Duration::from_millis(config.cadence.routing_ms),
         tx.clone(),
@@ -314,6 +314,14 @@ async fn run_inner(terminal: &mut crate::tui::Tui, config: Config) -> color_eyre
         if state.should_quit {
             break;
         }
+    }
+
+    // Stop the probes before returning. Aborting drops each task's future, which for the
+    // shell-out probes kills any in-flight child (`run_capture` sets `kill_on_drop`), so an
+    // in-progress `traceroute`/`system_profiler` can't stall shutdown while the runtime is
+    // torn down.
+    for handle in &handles {
+        handle.abort();
     }
     Ok(())
 }

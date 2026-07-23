@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 pub mod dns;
 pub mod link;
 pub mod ping;
+pub mod proc;
 pub mod pubip;
 pub mod reachability;
 pub mod routing;
