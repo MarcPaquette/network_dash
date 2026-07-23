@@ -32,6 +32,11 @@ pub fn map_key(key: KeyEvent) -> Option<Action> {
         KeyCode::Char('c') => Some(Action::ClearEvents),
         KeyCode::Char('r') => Some(Action::ForceRefresh),
         KeyCode::Char('t') => Some(Action::CycleTheme),
+        KeyCode::Char('?') => Some(Action::ToggleHelp),
+        KeyCode::Up | KeyCode::Char('k') => Some(Action::ScrollUp),
+        KeyCode::Down | KeyCode::Char('j') => Some(Action::ScrollDown),
+        KeyCode::PageUp => Some(Action::ScrollPageUp),
+        KeyCode::PageDown => Some(Action::ScrollPageDown),
         _ => None,
     }
 }
@@ -111,11 +116,14 @@ pub async fn run_once(config: Config) -> color_eyre::Result<()> {
     use crate::metrics::{MetricId, Probe};
 
     let mut state = AppState::new(config.clone());
-    if config.targets.gateway_auto
-        && config.targets.gateway.is_none()
-        && let Some(gw) = crate::net::detect_default_gateway()
-    {
-        state.register_target(gw, true);
+    if let Some(info) = crate::net::detect_route_info() {
+        if config.targets.gateway_auto
+            && config.targets.gateway.is_none()
+            && let Some(gw) = info.gateway.clone()
+        {
+            state.register_target(gw, true);
+        }
+        state.apply_route_info(&info);
     }
     let targets: Vec<String> = state.targets.keys().cloned().collect();
 
@@ -150,6 +158,10 @@ pub async fn run_once(config: Config) -> color_eyre::Result<()> {
         "NetPulse — one-shot probe  (overall: {})",
         badge(state.overall_health())
     );
+    for d in crate::diagnosis::diagnose(&state) {
+        let tag = d.layer.map_or("ok", |l| l.tag());
+        println!("  diag [{tag}] {}", d.headline);
+    }
     for m in [
         MetricId::Latency,
         MetricId::Loss,
@@ -193,12 +205,16 @@ async fn run_inner(terminal: &mut crate::tui::Tui, config: Config) -> color_eyre
     // Best-effort incident log; the dashboard still runs if it can't be opened.
     let mut log = IncidentLog::default_path().and_then(|path| IncidentLog::open_append(&path).ok());
 
-    // Detect the default gateway and register it as a (stricter-threshold) ping target.
-    if config.targets.gateway_auto
-        && config.targets.gateway.is_none()
-        && let Some(gw) = crate::net::detect_default_gateway()
-    {
-        state.register_target(gw, true);
+    // Detect the default route: register the gateway (as a stricter-threshold ping target)
+    // and record the interface / MTU / VPN facts.
+    if let Some(info) = crate::net::detect_route_info() {
+        if config.targets.gateway_auto
+            && config.targets.gateway.is_none()
+            && let Some(gw) = info.gateway.clone()
+        {
+            state.register_target(gw, true);
+        }
+        state.apply_route_info(&info);
     }
 
     let targets: Vec<String> = state.targets.keys().cloned().collect();
@@ -238,6 +254,20 @@ async fn run_inner(terminal: &mut crate::tui::Tui, config: Config) -> color_eyre
     _handles.push(spawn_probe(
         crate::metrics::throughput::ThroughputProbe::new(tput_interval),
         tput_interval,
+        tx.clone(),
+    ));
+
+    // Active capacity probe (a bounded download on a slow cadence).
+    _handles.push(spawn_probe(
+        crate::metrics::throughput::CapacityProbe::new(config.throughput.probe_url.clone()),
+        Duration::from_millis(config.cadence.throughput_probe_ms),
+        tx.clone(),
+    ));
+
+    // Public/WAN IP (for ISP-change detection), on a slow cadence.
+    _handles.push(spawn_probe(
+        crate::metrics::pubip::PublicIpProbe::cloudflare(),
+        Duration::from_millis(config.cadence.public_ip_ms),
         tx.clone(),
     ));
 
@@ -315,6 +345,20 @@ mod tests {
         assert_eq!(map_key(key(KeyCode::Char('c'))), Some(Action::ClearEvents));
         assert_eq!(map_key(key(KeyCode::Char('r'))), Some(Action::ForceRefresh));
         assert_eq!(map_key(key(KeyCode::Char('t'))), Some(Action::CycleTheme));
+    }
+
+    #[test]
+    fn help_and_scroll_keys_map() {
+        assert_eq!(map_key(key(KeyCode::Char('?'))), Some(Action::ToggleHelp));
+        assert_eq!(map_key(key(KeyCode::Up)), Some(Action::ScrollUp));
+        assert_eq!(map_key(key(KeyCode::Char('k'))), Some(Action::ScrollUp));
+        assert_eq!(map_key(key(KeyCode::Down)), Some(Action::ScrollDown));
+        assert_eq!(map_key(key(KeyCode::Char('j'))), Some(Action::ScrollDown));
+        assert_eq!(map_key(key(KeyCode::PageUp)), Some(Action::ScrollPageUp));
+        assert_eq!(
+            map_key(key(KeyCode::PageDown)),
+            Some(Action::ScrollPageDown)
+        );
     }
 
     #[test]

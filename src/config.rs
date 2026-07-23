@@ -135,6 +135,10 @@ pub struct ThresholdConfig {
     pub loss: Thresholds,
     pub dns: Thresholds,
     pub rssi: Thresholds,
+    /// Wi-Fi signal-to-noise ratio in dB (higher is better).
+    pub snr: Thresholds,
+    /// Added latency under load (bufferbloat) in ms (higher is worse).
+    pub bufferbloat: Thresholds,
     /// Consecutive samples required to commit a health change (debounce).
     pub debounce_samples: usize,
     /// Number of ping outcomes retained for the loss window.
@@ -152,6 +156,8 @@ impl Default for ThresholdConfig {
             loss: Thresholds::higher_is_worse(1.0, 5.0),
             dns: Thresholds::higher_is_worse(100.0, 300.0),
             rssi: Thresholds::lower_is_worse(-70.0, -80.0),
+            snr: Thresholds::lower_is_worse(20.0, 10.0),
+            bufferbloat: Thresholds::higher_is_worse(100.0, 300.0),
             debounce_samples: 3,
             loss_window: 60,
             history_len: 120,

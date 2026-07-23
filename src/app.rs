@@ -14,7 +14,7 @@ use crate::config::Config;
 use crate::health::{Debouncer, Health, Thresholds};
 use crate::history::{LossWindow, Series};
 use crate::incidents::Incident;
-use crate::metrics::{MetricId, Sample};
+use crate::metrics::{Hop, MetricId, Sample};
 use crate::ui::theme::Theme;
 
 /// Control actions (mapped from key input by the event loop).
@@ -26,6 +26,13 @@ pub enum Action {
     ForceRefresh,
     /// Advance to the next color theme (live cycle).
     CycleTheme,
+    /// Toggle the keybinding help overlay.
+    ToggleHelp,
+    /// Scroll the events feed toward older / newer incidents.
+    ScrollUp,
+    ScrollDown,
+    ScrollPageUp,
+    ScrollPageDown,
 }
 
 /// Per-ping-target rolling state and debounced health streams.
@@ -82,6 +89,13 @@ pub struct ResolverState {
     health: Debouncer,
 }
 
+impl ResolverState {
+    /// Current debounced health of this resolver (read by the diagnosis engine).
+    pub fn health_current(&self) -> Health {
+        self.health.current()
+    }
+}
+
 /// Per-endpoint reachability state.
 #[derive(Debug, Clone)]
 pub struct ReachState {
@@ -89,19 +103,34 @@ pub struct ReachState {
     health: Debouncer,
 }
 
-/// Throughput state: passive rx/tx history and the last capacity-probe result.
+/// Throughput state: passive rx/tx history, the last capacity-probe result, and the last
+/// bufferbloat (latency idle-vs-loaded) reading.
 #[derive(Debug, Clone, Default)]
 pub struct ThroughputState {
     pub rx_bps: Option<Series>,
     pub tx_bps: Option<Series>,
     pub last_mbps: Option<f64>,
+    pub idle_latency_ms: Option<f64>,
+    pub loaded_latency_ms: Option<f64>,
     health: Option<Debouncer>,
+    bufferbloat_health: Option<Debouncer>,
+}
+
+impl ThroughputState {
+    /// Current debounced bufferbloat health (read by the diagnosis engine).
+    pub fn bufferbloat_health_current(&self) -> Health {
+        self.bufferbloat_health
+            .as_ref()
+            .map_or(Health::Ok, |d| d.current())
+    }
 }
 
 /// Wireless link state.
 #[derive(Debug, Clone, Default)]
 pub struct LinkState {
     pub rssi_dbm: Option<f64>,
+    pub noise_dbm: Option<f64>,
+    pub tx_rate: Option<f64>,
     pub ssid: Option<String>,
     health: Option<Debouncer>,
 }
@@ -113,6 +142,8 @@ pub struct RoutingState {
     pub reachable: bool,
     pub changed: bool,
     pub seen: bool,
+    /// Per-hop detail from the last traceroute (address, best RTT, probe loss).
+    pub detail: Vec<Hop>,
     health: Option<Debouncer>,
 }
 
@@ -128,8 +159,20 @@ pub struct AppState {
     pub throughput: ThroughputState,
     pub link: LinkState,
     pub routing: RoutingState,
+    /// Whether a captive portal is currently intercepting web traffic.
+    pub captive_portal: bool,
+    /// Public/WAN IP (from the public-IP probe), for ISP/WAN-change detection.
+    pub public_ip: Option<String>,
+    /// Default-route interface, its MTU, and whether it runs over a VPN.
+    pub interface: Option<String>,
+    pub mtu: Option<u32>,
+    pub vpn: bool,
     pub events: VecDeque<Incident>,
     pub max_events: usize,
+    /// How many newest incidents are scrolled past in the events feed.
+    pub events_scroll: usize,
+    /// Whether the keybinding help overlay is showing.
+    pub show_help: bool,
     pub paused: bool,
     pub should_quit: bool,
 }
@@ -146,8 +189,15 @@ impl AppState {
             throughput: ThroughputState::default(),
             link: LinkState::default(),
             routing: RoutingState::default(),
+            captive_portal: false,
+            public_ip: None,
+            interface: None,
+            mtu: None,
+            vpn: false,
             events: VecDeque::new(),
             max_events: 200,
+            events_scroll: 0,
+            show_help: false,
             paused: false,
             should_quit: false,
             config,
@@ -181,18 +231,29 @@ impl AppState {
                 latency_ms,
             } => self.apply_dns(now, &resolver, latency_ms),
             Sample::Reachability { endpoint, ok } => self.apply_reachability(now, &endpoint, ok),
+            Sample::CaptivePortal { detected } => self.apply_captive(now, detected),
+            Sample::PublicIp { ip } => self.apply_public_ip(now, ip),
             Sample::Throughput { rx_bps, tx_bps } => {
                 self.apply_throughput(rx_bps, tx_bps);
                 Vec::new()
             }
             Sample::ThroughputProbe { mbps } => self.apply_throughput_probe(now, mbps),
-            Sample::Link { rssi_dbm, ssid } => self.apply_link(now, rssi_dbm, ssid),
+            Sample::Bufferbloat { idle_ms, loaded_ms } => {
+                self.apply_bufferbloat(now, idle_ms, loaded_ms)
+            }
+            Sample::Link {
+                rssi_dbm,
+                noise_dbm,
+                tx_rate,
+                ssid,
+            } => self.apply_link(now, rssi_dbm, noise_dbm, tx_rate, ssid),
             Sample::Routing {
                 target,
                 hops,
                 reachable,
                 changed,
-            } => self.apply_routing(now, &target, hops, reachable, changed),
+                detail,
+            } => self.apply_routing(now, &target, hops, reachable, changed, detail),
         };
         for inc in &incidents {
             self.push_event(inc.clone());
@@ -374,6 +435,97 @@ impl AppState {
         }
     }
 
+    /// Record default-route facts (interface, MTU, VPN) detected at startup.
+    pub fn apply_route_info(&mut self, info: &crate::net::RouteInfo) {
+        if info.interface.is_some() {
+            self.interface = info.interface.clone();
+        }
+        if info.mtu.is_some() {
+            self.mtu = info.mtu;
+        }
+        self.vpn = info.is_vpn();
+    }
+
+    fn apply_public_ip(&mut self, now: DateTime<Utc>, ip: String) -> Vec<Incident> {
+        let out = match &self.public_ip {
+            Some(old) if *old != ip => vec![status_incident(
+                now,
+                MetricId::Reachability,
+                "wan",
+                Health::Warn,
+                format!("public IP changed {old} → {ip}"),
+            )],
+            _ => Vec::new(), // first observation or unchanged — no incident
+        };
+        self.public_ip = Some(ip);
+        out
+    }
+
+    fn apply_bufferbloat(
+        &mut self,
+        now: DateTime<Utc>,
+        idle_ms: f64,
+        loaded_ms: f64,
+    ) -> Vec<Incident> {
+        let cfg = self.config.clone();
+        self.throughput.idle_latency_ms = Some(idle_ms);
+        self.throughput.loaded_latency_ms = Some(loaded_ms);
+        let delta = (loaded_ms - idle_ms).max(0.0);
+        let thr = cfg.thresholds.bufferbloat;
+        let raw = thr.evaluate(delta);
+        let health = self
+            .throughput
+            .bufferbloat_health
+            .get_or_insert_with(|| Debouncer::new(Health::Ok, cfg.thresholds.debounce_samples));
+        match health.update(raw) {
+            Some(Health::Ok) => vec![status_incident(
+                now,
+                MetricId::Throughput,
+                "bufferbloat",
+                Health::Ok,
+                "bufferbloat cleared".to_string(),
+            )],
+            Some(sev) => {
+                let inc = Incident::new(
+                    now,
+                    MetricId::Throughput,
+                    sev,
+                    format!("bufferbloat +{delta:.0}ms under load"),
+                )
+                .with_value(delta, "ms")
+                .with_target("bufferbloat");
+                vec![match sev {
+                    Health::Crit => inc.with_threshold(thr.crit),
+                    _ => inc.with_threshold(thr.warn),
+                }]
+            }
+            None => Vec::new(),
+        }
+    }
+
+    fn apply_captive(&mut self, now: DateTime<Utc>, detected: bool) -> Vec<Incident> {
+        let changed = self.captive_portal != detected;
+        self.captive_portal = detected;
+        if !changed {
+            return Vec::new();
+        }
+        let (sev, msg) = if detected {
+            (
+                Health::Crit,
+                "captive portal detected (sign-in required)".to_string(),
+            )
+        } else {
+            (Health::Ok, "captive portal cleared".to_string())
+        };
+        vec![status_incident(
+            now,
+            MetricId::Reachability,
+            "captive",
+            sev,
+            msg,
+        )]
+    }
+
     fn apply_throughput(&mut self, rx_bps: f64, tx_bps: f64) {
         let cap = self.config.thresholds.history_len;
         self.throughput
@@ -427,12 +579,20 @@ impl AppState {
         &mut self,
         now: DateTime<Utc>,
         rssi_dbm: Option<f64>,
+        noise_dbm: Option<f64>,
+        tx_rate: Option<f64>,
         ssid: Option<String>,
     ) -> Vec<Incident> {
         let cfg = self.config.clone();
         let thr = cfg.thresholds.rssi;
         if ssid.is_some() {
             self.link.ssid = ssid;
+        }
+        if noise_dbm.is_some() {
+            self.link.noise_dbm = noise_dbm;
+        }
+        if tx_rate.is_some() {
+            self.link.tx_rate = tx_rate;
         }
         let Some(rssi) = rssi_dbm else {
             return Vec::new();
@@ -464,11 +624,13 @@ impl AppState {
         hops: usize,
         reachable: bool,
         changed: bool,
+        detail: Vec<Hop>,
     ) -> Vec<Incident> {
         let cfg = self.config.clone();
         self.routing.hops = hops;
         self.routing.reachable = reachable;
         self.routing.changed = changed;
+        self.routing.detail = detail;
         self.routing.seen = true;
         let raw = if !reachable {
             Health::Crit
@@ -507,12 +669,22 @@ impl AppState {
 
     /// Apply a control action.
     pub fn apply_action(&mut self, action: Action) {
+        // Highest incident index we can scroll to (keep at least one visible).
+        let max_scroll = self.events.len().saturating_sub(1);
         match action {
             Action::Quit => self.should_quit = true,
             Action::TogglePause => self.paused = !self.paused,
-            Action::ClearEvents => self.events.clear(),
+            Action::ClearEvents => {
+                self.events.clear();
+                self.events_scroll = 0;
+            }
             Action::ForceRefresh => {} // handled by the event loop (re-triggers probes)
             Action::CycleTheme => self.theme = self.theme.next(),
+            Action::ToggleHelp => self.show_help = !self.show_help,
+            Action::ScrollUp => self.events_scroll = (self.events_scroll + 1).min(max_scroll),
+            Action::ScrollDown => self.events_scroll = self.events_scroll.saturating_sub(1),
+            Action::ScrollPageUp => self.events_scroll = (self.events_scroll + 5).min(max_scroll),
+            Action::ScrollPageDown => self.events_scroll = self.events_scroll.saturating_sub(5),
         }
     }
 
@@ -917,6 +1089,99 @@ mod tests {
     }
 
     #[test]
+    fn captive_portal_sets_state_and_logs_on_change() {
+        let mut s = AppState::new(test_config());
+        // First "clear" reading matches the default — no spurious incident.
+        assert!(
+            s.apply_sample(now(), Sample::CaptivePortal { detected: false })
+                .is_empty()
+        );
+        assert!(!s.captive_portal);
+
+        // Detecting a portal flips the state and logs a crit incident.
+        let hit = s.apply_sample(now(), Sample::CaptivePortal { detected: true });
+        assert!(s.captive_portal);
+        assert_eq!(hit.len(), 1);
+        assert_eq!(hit[0].severity, Health::Crit);
+
+        // A steady portal reading does not re-log.
+        assert!(
+            s.apply_sample(now(), Sample::CaptivePortal { detected: true })
+                .is_empty()
+        );
+
+        // Clearing flips back and logs recovery.
+        let cleared = s.apply_sample(now(), Sample::CaptivePortal { detected: false });
+        assert!(!s.captive_portal);
+        assert_eq!(cleared.len(), 1);
+        assert_eq!(cleared[0].severity, Health::Ok);
+    }
+
+    #[test]
+    fn public_ip_change_is_logged_but_first_sight_is_silent() {
+        let mut s = AppState::new(test_config());
+        // First observation just records the IP — no incident.
+        assert!(
+            s.apply_sample(
+                now(),
+                Sample::PublicIp {
+                    ip: "1.2.3.4".into()
+                }
+            )
+            .is_empty()
+        );
+        assert_eq!(s.public_ip.as_deref(), Some("1.2.3.4"));
+        // Same IP again — still silent.
+        assert!(
+            s.apply_sample(
+                now(),
+                Sample::PublicIp {
+                    ip: "1.2.3.4".into()
+                }
+            )
+            .is_empty()
+        );
+        // A change is logged (WAN flap / failover / CGNAT shuffle).
+        let out = s.apply_sample(
+            now(),
+            Sample::PublicIp {
+                ip: "5.6.7.8".into(),
+            },
+        );
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].severity, Health::Warn);
+        assert_eq!(s.public_ip.as_deref(), Some("5.6.7.8"));
+    }
+
+    #[test]
+    fn bufferbloat_over_threshold_warns() {
+        let mut s = AppState::new(test_config()); // bufferbloat warn 100 / crit 300 ms
+        // +150 ms under load → Warn once debounced.
+        let sample = Sample::Bufferbloat {
+            idle_ms: 20.0,
+            loaded_ms: 170.0,
+        };
+        s.apply_sample(now(), sample.clone());
+        let out = s.apply_sample(now(), sample);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].severity, Health::Warn);
+        assert_eq!(s.throughput.loaded_latency_ms, Some(170.0));
+    }
+
+    #[test]
+    fn route_info_populates_interface_mtu_and_vpn() {
+        let mut s = AppState::new(test_config());
+        s.apply_route_info(&crate::net::RouteInfo {
+            gateway: Some("10.8.0.1".into()),
+            interface: Some("utun3".into()),
+            mtu: Some(1400),
+        });
+        assert_eq!(s.interface.as_deref(), Some("utun3"));
+        assert_eq!(s.mtu, Some(1400));
+        assert!(s.vpn, "utun3 default route should mark VPN active");
+    }
+
+    #[test]
     fn throughput_passive_fills_series_without_incident() {
         let mut s = AppState::new(test_config());
         let out = s.apply_sample(
@@ -951,6 +1216,8 @@ mod tests {
             now(),
             Sample::Link {
                 rssi_dbm: Some(-75.0),
+                noise_dbm: None,
+                tx_rate: None,
                 ssid: Some("MyNet".into()),
             },
         );
@@ -958,6 +1225,8 @@ mod tests {
             now(),
             Sample::Link {
                 rssi_dbm: Some(-76.0),
+                noise_dbm: None,
+                tx_rate: None,
                 ssid: None,
             },
         );
@@ -976,6 +1245,7 @@ mod tests {
             hops: 0,
             reachable: false,
             changed: false,
+            detail: vec![],
         };
         s.apply_sample(now(), r.clone());
         let out = s.apply_sample(now(), r);
@@ -994,6 +1264,7 @@ mod tests {
                 hops: 8,
                 reachable: true,
                 changed: true,
+                detail: vec![],
             },
         );
         let out = s.apply_sample(
@@ -1003,10 +1274,44 @@ mod tests {
                 hops: 9,
                 reachable: true,
                 changed: true,
+                detail: vec![],
             },
         );
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].severity, Health::Warn);
+    }
+
+    #[test]
+    fn help_toggles_and_clear_resets_scroll() {
+        let mut s = AppState::new(test_config());
+        assert!(!s.show_help);
+        s.apply_action(Action::ToggleHelp);
+        assert!(s.show_help);
+        s.apply_action(Action::ToggleHelp);
+        assert!(!s.show_help);
+
+        // Scrolling is clamped to the number of events (can't scroll an empty feed).
+        s.apply_action(Action::ScrollUp);
+        assert_eq!(s.events_scroll, 0, "no events → no scroll");
+    }
+
+    #[test]
+    fn scroll_is_bounded_by_event_count() {
+        let mut s = AppState::new(test_config());
+        // Generate a few incidents (loss crit transitions).
+        for _ in 0..3 {
+            s.apply_sample(now(), timeout("1.1.1.1"));
+        }
+        assert!(!s.events.is_empty());
+        // Scroll far past the end — clamps to len-1, and never underflows.
+        for _ in 0..50 {
+            s.apply_action(Action::ScrollUp);
+        }
+        assert_eq!(s.events_scroll, s.events.len() - 1);
+        for _ in 0..50 {
+            s.apply_action(Action::ScrollDown);
+        }
+        assert_eq!(s.events_scroll, 0);
     }
 
     #[test]
