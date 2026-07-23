@@ -191,9 +191,9 @@ impl Default for ThroughputConfig {
 pub struct UiConfig {
     pub color: bool,
     pub sparkline_points: usize,
-    /// Color theme name. One of: `default`, `neon_sunset`, `moss_goblin`,
-    /// `cybercity_night`, `cottage_fire`. Unknown names fall back to `default`.
-    /// Can also be cycled live at runtime with the `t` key.
+    /// Color theme name; must be one of the built-in catalog (see `Theme::NAMES` in
+    /// `ui::theme` — `default`, `neon_sunset`, `dracula`, `nord`, …). Unknown names fall
+    /// back to `default`. Can also be chosen live at runtime via the `t` theme picker.
     pub theme: String,
 }
 
@@ -202,7 +202,7 @@ impl Default for UiConfig {
         Self {
             color: true,
             sparkline_points: 120,
-            theme: "default".to_string(),
+            theme: "neon_sunset".to_string(),
         }
     }
 }
@@ -284,7 +284,10 @@ mod tests {
         assert!(c.thresholds.history_len > 0);
         assert!(!c.throughput.probe_url.is_empty());
         assert!(c.ui.color);
-        assert_eq!(c.ui.theme, "default", "neutral theme out of the box");
+        assert_eq!(
+            c.ui.theme, "neon_sunset",
+            "neon sunset theme out of the box"
+        );
     }
 
     #[test]

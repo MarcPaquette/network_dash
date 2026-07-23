@@ -31,12 +31,29 @@ pub fn map_key(key: KeyEvent) -> Option<Action> {
         KeyCode::Char('p') => Some(Action::TogglePause),
         KeyCode::Char('c') => Some(Action::ClearEvents),
         KeyCode::Char('r') => Some(Action::ForceRefresh),
-        KeyCode::Char('t') => Some(Action::CycleTheme),
+        KeyCode::Char('t') => Some(Action::OpenThemePicker),
         KeyCode::Char('?') => Some(Action::ToggleHelp),
         KeyCode::Up | KeyCode::Char('k') => Some(Action::ScrollUp),
         KeyCode::Down | KeyCode::Char('j') => Some(Action::ScrollDown),
         KeyCode::PageUp => Some(Action::ScrollPageUp),
         KeyCode::PageDown => Some(Action::ScrollPageDown),
+        _ => None,
+    }
+}
+
+/// Key mapping while the theme picker overlay is open (modal): the same keys that normally
+/// scroll or quit instead drive the picker. `↑`/`k` and `↓`/`j` move the live preview,
+/// Enter/`t` keep the highlighted theme, Esc/`q` revert to the pre-open theme, and Ctrl-C
+/// still quits the app.
+pub fn map_picker_key(key: KeyEvent) -> Option<Action> {
+    if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
+        return Some(Action::Quit);
+    }
+    match key.code {
+        KeyCode::Up | KeyCode::Char('k') => Some(Action::ThemePreviewUp),
+        KeyCode::Down | KeyCode::Char('j') => Some(Action::ThemePreviewDown),
+        KeyCode::Enter | KeyCode::Char('t') => Some(Action::ThemePickerConfirm),
+        KeyCode::Esc | KeyCode::Char('q') => Some(Action::ThemePickerCancel),
         _ => None,
     }
 }
@@ -296,9 +313,17 @@ async fn run_inner(terminal: &mut crate::tui::Tui, config: Config) -> color_eyre
             maybe_event = reader.next() => {
                 if let Some(Ok(Event::Key(key))) = maybe_event
                     && key.kind == KeyEventKind::Press
-                    && let Some(action) = map_key(key)
                 {
-                    state.apply_action(action);
+                    // While the theme picker is open it is modal: route keys through it so
+                    // ↑/↓ preview and Esc reverts instead of scrolling / quitting.
+                    let action = if state.theme_picker.is_some() {
+                        map_picker_key(key)
+                    } else {
+                        map_key(key)
+                    };
+                    if let Some(action) = action {
+                        state.apply_action(action);
+                    }
                 }
             }
             Some(sample) = rx.recv() => {
@@ -352,7 +377,52 @@ mod tests {
         assert_eq!(map_key(key(KeyCode::Char('p'))), Some(Action::TogglePause));
         assert_eq!(map_key(key(KeyCode::Char('c'))), Some(Action::ClearEvents));
         assert_eq!(map_key(key(KeyCode::Char('r'))), Some(Action::ForceRefresh));
-        assert_eq!(map_key(key(KeyCode::Char('t'))), Some(Action::CycleTheme));
+        assert_eq!(
+            map_key(key(KeyCode::Char('t'))),
+            Some(Action::OpenThemePicker)
+        );
+    }
+
+    #[test]
+    fn picker_keys_drive_the_overlay() {
+        // Preview navigation (arrows and vi keys).
+        assert_eq!(
+            map_picker_key(key(KeyCode::Up)),
+            Some(Action::ThemePreviewUp)
+        );
+        assert_eq!(
+            map_picker_key(key(KeyCode::Char('k'))),
+            Some(Action::ThemePreviewUp)
+        );
+        assert_eq!(
+            map_picker_key(key(KeyCode::Down)),
+            Some(Action::ThemePreviewDown)
+        );
+        assert_eq!(
+            map_picker_key(key(KeyCode::Char('j'))),
+            Some(Action::ThemePreviewDown)
+        );
+        // Enter / t confirm; Esc / q cancel.
+        assert_eq!(
+            map_picker_key(key(KeyCode::Enter)),
+            Some(Action::ThemePickerConfirm)
+        );
+        assert_eq!(
+            map_picker_key(key(KeyCode::Char('t'))),
+            Some(Action::ThemePickerConfirm)
+        );
+        assert_eq!(
+            map_picker_key(key(KeyCode::Esc)),
+            Some(Action::ThemePickerCancel)
+        );
+        assert_eq!(
+            map_picker_key(key(KeyCode::Char('q'))),
+            Some(Action::ThemePickerCancel)
+        );
+        // Ctrl-C still quits from within the picker; unrelated keys are swallowed.
+        let ctrl_c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
+        assert_eq!(map_picker_key(ctrl_c), Some(Action::Quit));
+        assert_eq!(map_picker_key(key(KeyCode::Char('p'))), None);
     }
 
     #[test]

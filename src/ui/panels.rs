@@ -85,6 +85,10 @@ pub fn render(frame: &mut Frame, state: &AppState) {
     if state.show_help {
         help_overlay(frame, frame.area(), state);
     }
+    // The theme picker (modal) draws on top when open.
+    if state.theme_picker.is_some() {
+        theme_picker_overlay(frame, frame.area(), state);
+    }
 }
 
 /// A centered rectangle of at most `width`×`height` within `area`.
@@ -106,7 +110,7 @@ pub fn help_overlay(frame: &mut Frame, area: Rect, state: &AppState) {
         "p           pause / resume",
         "r           force refresh",
         "c           clear events",
-        "t           cycle theme",
+        "t           theme picker",
         "↑ / ↓  k/j  scroll events",
         "PgUp/PgDn   page events",
         "?           toggle this help",
@@ -117,6 +121,47 @@ pub fn help_overlay(frame: &mut Frame, area: Rect, state: &AppState) {
         .title(" HELP ")
         .border_style(Style::default().fg(state.theme.accent));
     let lines: Vec<Line> = rows.iter().map(|r| Line::from(*r)).collect();
+    frame.render_widget(Clear, rect);
+    frame.render_widget(Paragraph::new(lines).block(block), rect);
+}
+
+/// Theme picker overlay: browse the catalog with a live preview of the whole dashboard
+/// (opened with `t`; ↑/↓ preview, Enter keeps, Esc reverts). Each row shows the theme's
+/// ok/warn/crit swatch so a palette can be judged without selecting it.
+pub fn theme_picker_overlay(frame: &mut Frame, area: Rect, state: &AppState) {
+    let Some(picker) = state.theme_picker else {
+        return;
+    };
+    let names = theme::Theme::NAMES;
+    let mut lines: Vec<Line> = Vec::with_capacity(names.len() + 2);
+    for (i, name) in names.iter().enumerate() {
+        let t = theme::Theme::resolve(name);
+        let selected = i == picker.index;
+        let name_style = if selected {
+            Style::default().fg(state.theme.accent).bold()
+        } else {
+            Style::default().fg(state.theme.muted)
+        };
+        lines.push(Line::from(vec![
+            Span::raw(if selected { "▶ " } else { "  " }),
+            Span::styled("●", Style::default().fg(t.ok)),
+            Span::styled("●", Style::default().fg(t.warn)),
+            Span::styled("●", Style::default().fg(t.crit)),
+            Span::raw(" "),
+            Span::styled(*name, name_style),
+        ]));
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "↑↓ preview · enter keep · esc revert",
+        Style::default().fg(state.theme.muted),
+    )));
+
+    let rect = centered_rect(area, 40, lines.len() as u16 + 2);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(" THEME ")
+        .border_style(Style::default().fg(state.theme.accent));
     frame.render_widget(Clear, rect);
     frame.render_widget(Paragraph::new(lines).block(block), rect);
 }
@@ -620,7 +665,6 @@ mod tests {
     use chrono::{TimeZone, Utc};
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
-    use ratatui::style::Color;
 
     fn test_state() -> AppState {
         let mut c = Config::default();
@@ -844,12 +888,12 @@ mod tests {
         let mut term = Terminal::new(TestBackend::new(120, 8)).unwrap();
         term.draw(|f| diagnosis(f, f.area(), &state)).unwrap();
         let buf = term.backend().buffer();
-        let crit = Theme::default().crit;
+        let crit = state.theme.crit; // active theme's crit color
         // The top-left border corner carries the panel's health color.
         assert_eq!(
             buf[(0, 0)].fg,
             crit,
-            "crit diagnosis should paint the border red"
+            "crit diagnosis should paint the border with the active theme's crit color"
         );
     }
 
@@ -925,8 +969,39 @@ mod tests {
         let text = buffer_text(&term);
         assert!(text.contains("HELP"), "overlay title should show: {text}");
         assert!(
-            text.contains("cycle theme"),
+            text.contains("theme picker"),
             "overlay body should show keys"
+        );
+    }
+
+    #[test]
+    fn theme_picker_overlay_renders_when_open() {
+        use crate::app::Action;
+        use ratatui::style::Modifier;
+        let mut state = test_state();
+        state.apply_action(Action::OpenThemePicker);
+        state.apply_action(Action::ThemePreviewDown); // move the highlight off the first row
+        // Tall enough to fit the whole catalog overlay (one row per theme + footer).
+        let mut term = Terminal::new(TestBackend::new(60, 30)).unwrap();
+        term.draw(|f| theme_picker_overlay(f, f.area(), &state))
+            .unwrap();
+        let text = buffer_text(&term);
+        assert!(text.contains("THEME"), "overlay title should show: {text}");
+        assert!(
+            text.contains("dracula") && text.contains("gruvbox"),
+            "theme names should be listed: {text}"
+        );
+        assert!(
+            text.contains("preview") && text.contains("revert"),
+            "footer hint should show: {text}"
+        );
+        // The selected row is the only bold text, so a bold cell proves the highlight.
+        let buf = term.backend().buffer();
+        assert!(
+            buf.content
+                .iter()
+                .any(|c| c.modifier.contains(Modifier::BOLD)),
+            "selected theme row should be highlighted (bold)"
         );
     }
 
@@ -1017,8 +1092,8 @@ mod tests {
         );
         let mut term = Terminal::new(TestBackend::new(40, 10)).unwrap();
         term.draw(|f| loss(f, f.area(), &state)).unwrap();
-        // top-left border corner should be red
-        assert_eq!(term.backend().buffer()[(0, 0)].fg, Color::Red);
+        // top-left border corner should carry the active theme's crit color
+        assert_eq!(term.backend().buffer()[(0, 0)].fg, state.theme.crit);
     }
 
     #[test]

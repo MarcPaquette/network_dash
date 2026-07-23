@@ -40,12 +40,27 @@ pub struct Theme {
 
 impl Theme {
     /// All selectable theme names, in cycle order. `default` is first (out-of-box look).
-    pub const NAMES: [&'static str; 5] = [
+    pub const NAMES: [&'static str; 20] = [
         "default",
         "neon_sunset",
         "moss_goblin",
         "cybercity_night",
         "cottage_fire",
+        "arctic_aurora",
+        "vaporwave",
+        "dracula",
+        "nord",
+        "gruvbox",
+        "tokyo_night",
+        "catppuccin",
+        "solarized_dark",
+        "monokai",
+        "rose_pine",
+        "sakura",
+        "deep_ocean",
+        "desert_dune",
+        "synthwave",
+        "harvest",
     ];
 
     /// The neutral built-in theme — reproduces the original hardcoded palette exactly.
@@ -163,6 +178,351 @@ impl Theme {
         }
     }
 
+    /// Icy aurora: glacier-blue accent, mint/amber health, cool northern-lights palette.
+    fn arctic_aurora() -> Theme {
+        Theme {
+            name: "arctic_aurora",
+            ok: Color::Rgb(126, 224, 184),
+            warn: Color::Rgb(240, 200, 96),
+            crit: Color::Rgb(240, 96, 112),
+            border_ok: Color::Rgb(70, 100, 130),
+            accent: Color::Rgb(94, 205, 255),
+            rx: Color::Rgb(126, 224, 184),
+            tx: Color::Rgb(150, 150, 255),
+            muted: Color::Rgb(96, 116, 140),
+            series: [
+                Color::Rgb(94, 205, 255),  // glacier blue
+                Color::Rgb(126, 224, 184), // mint
+                Color::Rgb(168, 140, 255), // periwinkle
+                Color::Rgb(120, 240, 220), // ice teal
+                Color::Rgb(240, 200, 96),  // amber
+                Color::Rgb(255, 120, 160), // rose
+            ],
+        }
+    }
+
+    /// 80s vaporwave: purple accent, teal/gold health, hot-pink & cyan chart palette.
+    fn vaporwave() -> Theme {
+        Theme {
+            name: "vaporwave",
+            ok: Color::Rgb(94, 234, 212),
+            warn: Color::Rgb(255, 214, 102),
+            crit: Color::Rgb(255, 84, 132),
+            border_ok: Color::Rgb(108, 92, 160),
+            accent: Color::Rgb(178, 112, 255),
+            rx: Color::Rgb(94, 234, 212),
+            tx: Color::Rgb(255, 128, 224),
+            muted: Color::Rgb(130, 110, 160),
+            series: [
+                Color::Rgb(255, 113, 206), // hot pink
+                Color::Rgb(1, 205, 254),   // cyan
+                Color::Rgb(178, 112, 255), // purple
+                Color::Rgb(5, 255, 161),   // mint
+                Color::Rgb(255, 214, 102), // gold
+                Color::Rgb(255, 128, 224), // magenta
+            ],
+        }
+    }
+
+    /// Dracula: canonical purple accent, green/orange health, pink & cyan chart palette.
+    fn dracula() -> Theme {
+        Theme {
+            name: "dracula",
+            ok: Color::Rgb(80, 250, 123),
+            warn: Color::Rgb(255, 184, 108),
+            crit: Color::Rgb(255, 85, 85),
+            border_ok: Color::Rgb(98, 114, 164),
+            accent: Color::Rgb(189, 147, 249),
+            rx: Color::Rgb(139, 233, 253),
+            tx: Color::Rgb(255, 121, 198),
+            muted: Color::Rgb(98, 114, 164),
+            series: [
+                Color::Rgb(189, 147, 249), // purple
+                Color::Rgb(255, 121, 198), // pink
+                Color::Rgb(139, 233, 253), // cyan
+                Color::Rgb(80, 250, 123),  // green
+                Color::Rgb(255, 184, 108), // orange
+                Color::Rgb(241, 250, 140), // yellow
+            ],
+        }
+    }
+
+    /// Nord: frost-blue accent, muted green/yellow health, arctic aurora chart palette.
+    fn nord() -> Theme {
+        Theme {
+            name: "nord",
+            ok: Color::Rgb(163, 190, 140),
+            warn: Color::Rgb(235, 203, 139),
+            crit: Color::Rgb(191, 97, 106),
+            border_ok: Color::Rgb(76, 86, 106),
+            accent: Color::Rgb(136, 192, 208),
+            rx: Color::Rgb(143, 188, 187),
+            tx: Color::Rgb(180, 142, 173),
+            muted: Color::Rgb(97, 110, 136),
+            series: [
+                Color::Rgb(136, 192, 208), // frost
+                Color::Rgb(180, 142, 173), // purple
+                Color::Rgb(163, 190, 140), // green
+                Color::Rgb(235, 203, 139), // yellow
+                Color::Rgb(129, 161, 193), // blue
+                Color::Rgb(208, 135, 112), // orange
+            ],
+        }
+    }
+
+    /// Gruvbox: retro orange accent, green/yellow health, warm earthy chart palette.
+    fn gruvbox() -> Theme {
+        Theme {
+            name: "gruvbox",
+            ok: Color::Rgb(184, 187, 38),
+            warn: Color::Rgb(250, 189, 47),
+            crit: Color::Rgb(251, 73, 52),
+            border_ok: Color::Rgb(102, 92, 84),
+            accent: Color::Rgb(254, 128, 25),
+            rx: Color::Rgb(142, 192, 124),
+            tx: Color::Rgb(131, 165, 152),
+            muted: Color::Rgb(146, 131, 116),
+            series: [
+                Color::Rgb(254, 128, 25),  // orange
+                Color::Rgb(184, 187, 38),  // green
+                Color::Rgb(250, 189, 47),  // yellow
+                Color::Rgb(131, 165, 152), // blue
+                Color::Rgb(211, 134, 155), // purple
+                Color::Rgb(142, 192, 124), // aqua
+            ],
+        }
+    }
+
+    /// Tokyo Night: soft indigo accent, muted green/amber health, storm-blue chart palette.
+    fn tokyo_night() -> Theme {
+        Theme {
+            name: "tokyo_night",
+            ok: Color::Rgb(158, 206, 106),
+            warn: Color::Rgb(224, 175, 104),
+            crit: Color::Rgb(247, 118, 142),
+            border_ok: Color::Rgb(86, 95, 137),
+            accent: Color::Rgb(122, 162, 247),
+            rx: Color::Rgb(125, 207, 255),
+            tx: Color::Rgb(187, 154, 247),
+            muted: Color::Rgb(86, 95, 137),
+            series: [
+                Color::Rgb(122, 162, 247), // blue
+                Color::Rgb(187, 154, 247), // magenta
+                Color::Rgb(125, 207, 255), // cyan
+                Color::Rgb(158, 206, 106), // green
+                Color::Rgb(224, 175, 104), // orange
+                Color::Rgb(247, 118, 142), // red
+            ],
+        }
+    }
+
+    /// Catppuccin Mocha: mauve accent, green/peach health, pastel chart palette.
+    fn catppuccin() -> Theme {
+        Theme {
+            name: "catppuccin",
+            ok: Color::Rgb(166, 227, 161),
+            warn: Color::Rgb(250, 179, 135),
+            crit: Color::Rgb(243, 139, 168),
+            border_ok: Color::Rgb(108, 112, 134),
+            accent: Color::Rgb(203, 166, 247),
+            rx: Color::Rgb(148, 226, 213),
+            tx: Color::Rgb(245, 194, 231),
+            muted: Color::Rgb(108, 112, 134),
+            series: [
+                Color::Rgb(203, 166, 247), // mauve
+                Color::Rgb(245, 194, 231), // pink
+                Color::Rgb(137, 180, 250), // blue
+                Color::Rgb(166, 227, 161), // green
+                Color::Rgb(249, 226, 175), // yellow
+                Color::Rgb(250, 179, 135), // peach
+            ],
+        }
+    }
+
+    /// Solarized Dark: cyan accent, olive/amber health, the classic solarized accents.
+    fn solarized_dark() -> Theme {
+        Theme {
+            name: "solarized_dark",
+            ok: Color::Rgb(133, 153, 0),
+            warn: Color::Rgb(181, 137, 0),
+            crit: Color::Rgb(220, 50, 47),
+            border_ok: Color::Rgb(88, 110, 117),
+            accent: Color::Rgb(42, 161, 152),
+            rx: Color::Rgb(38, 139, 210),
+            tx: Color::Rgb(211, 54, 130),
+            muted: Color::Rgb(88, 110, 117),
+            series: [
+                Color::Rgb(42, 161, 152),  // cyan
+                Color::Rgb(38, 139, 210),  // blue
+                Color::Rgb(133, 153, 0),   // green
+                Color::Rgb(181, 137, 0),   // yellow
+                Color::Rgb(211, 54, 130),  // magenta
+                Color::Rgb(108, 113, 196), // violet
+            ],
+        }
+    }
+
+    /// Monokai: cyan accent, lime/yellow health, the signature hot-pink chart palette.
+    fn monokai() -> Theme {
+        Theme {
+            name: "monokai",
+            ok: Color::Rgb(166, 226, 46),
+            warn: Color::Rgb(230, 219, 116),
+            crit: Color::Rgb(249, 38, 114),
+            border_ok: Color::Rgb(117, 113, 94),
+            accent: Color::Rgb(102, 217, 239),
+            rx: Color::Rgb(102, 217, 239),
+            tx: Color::Rgb(174, 129, 255),
+            muted: Color::Rgb(117, 113, 94),
+            series: [
+                Color::Rgb(249, 38, 114),  // pink
+                Color::Rgb(166, 226, 46),  // lime
+                Color::Rgb(102, 217, 239), // cyan
+                Color::Rgb(253, 151, 31),  // orange
+                Color::Rgb(174, 129, 255), // purple
+                Color::Rgb(230, 219, 116), // yellow
+            ],
+        }
+    }
+
+    /// Rosé Pine: rose accent, foam/gold health, iris & pine chart palette.
+    fn rose_pine() -> Theme {
+        Theme {
+            name: "rose_pine",
+            ok: Color::Rgb(156, 207, 216),
+            warn: Color::Rgb(246, 193, 119),
+            crit: Color::Rgb(235, 111, 146),
+            border_ok: Color::Rgb(110, 106, 134),
+            accent: Color::Rgb(235, 188, 186),
+            rx: Color::Rgb(156, 207, 216),
+            tx: Color::Rgb(196, 167, 231),
+            muted: Color::Rgb(110, 106, 134),
+            series: [
+                Color::Rgb(196, 167, 231), // iris
+                Color::Rgb(235, 111, 146), // love
+                Color::Rgb(156, 207, 216), // foam
+                Color::Rgb(246, 193, 119), // gold
+                Color::Rgb(49, 116, 143),  // pine
+                Color::Rgb(235, 188, 186), // rose
+            ],
+        }
+    }
+
+    /// Sakura: blossom-pink accent, leaf-green/amber health, soft spring chart palette.
+    fn sakura() -> Theme {
+        Theme {
+            name: "sakura",
+            ok: Color::Rgb(150, 205, 140),
+            warn: Color::Rgb(240, 190, 100),
+            crit: Color::Rgb(235, 90, 110),
+            border_ok: Color::Rgb(150, 120, 135),
+            accent: Color::Rgb(255, 145, 175),
+            rx: Color::Rgb(150, 205, 140),
+            tx: Color::Rgb(200, 150, 220),
+            muted: Color::Rgb(160, 130, 145),
+            series: [
+                Color::Rgb(255, 145, 175), // blossom
+                Color::Rgb(255, 183, 197), // petal
+                Color::Rgb(200, 150, 220), // wisteria
+                Color::Rgb(150, 205, 140), // leaf
+                Color::Rgb(240, 190, 100), // amber
+                Color::Rgb(120, 180, 200), // sky
+            ],
+        }
+    }
+
+    /// Deep Ocean: teal accent, aquamarine/gold health, abyssal blue chart palette.
+    fn deep_ocean() -> Theme {
+        Theme {
+            name: "deep_ocean",
+            ok: Color::Rgb(72, 207, 173),
+            warn: Color::Rgb(240, 196, 84),
+            crit: Color::Rgb(240, 98, 110),
+            border_ok: Color::Rgb(40, 70, 95),
+            accent: Color::Rgb(0, 168, 204),
+            rx: Color::Rgb(72, 207, 173),
+            tx: Color::Rgb(94, 140, 220),
+            muted: Color::Rgb(70, 100, 125),
+            series: [
+                Color::Rgb(0, 168, 204),   // teal
+                Color::Rgb(72, 207, 173),  // aquamarine
+                Color::Rgb(94, 140, 220),  // blue
+                Color::Rgb(240, 196, 84),  // gold
+                Color::Rgb(240, 98, 110),  // coral
+                Color::Rgb(130, 110, 200), // violet
+            ],
+        }
+    }
+
+    /// Desert Dune: sand accent, sage/gold health, terracotta chart palette.
+    fn desert_dune() -> Theme {
+        Theme {
+            name: "desert_dune",
+            ok: Color::Rgb(166, 180, 110),
+            warn: Color::Rgb(226, 170, 70),
+            crit: Color::Rgb(200, 80, 55),
+            border_ok: Color::Rgb(120, 100, 80),
+            accent: Color::Rgb(210, 155, 100),
+            rx: Color::Rgb(166, 180, 110),
+            tx: Color::Rgb(180, 130, 90),
+            muted: Color::Rgb(140, 120, 100),
+            series: [
+                Color::Rgb(210, 155, 100), // sand
+                Color::Rgb(226, 170, 70),  // gold
+                Color::Rgb(200, 80, 55),   // terracotta
+                Color::Rgb(166, 180, 110), // sage
+                Color::Rgb(228, 205, 160), // dune cream
+                Color::Rgb(150, 110, 80),  // clay
+            ],
+        }
+    }
+
+    /// Synthwave '84: electric-purple accent, neon mint/gold health, retro chart palette.
+    fn synthwave() -> Theme {
+        Theme {
+            name: "synthwave",
+            ok: Color::Rgb(63, 240, 180),
+            warn: Color::Rgb(255, 199, 95),
+            crit: Color::Rgb(255, 66, 110),
+            border_ok: Color::Rgb(90, 70, 140),
+            accent: Color::Rgb(211, 54, 255),
+            rx: Color::Rgb(0, 240, 255),
+            tx: Color::Rgb(255, 113, 206),
+            muted: Color::Rgb(120, 95, 160),
+            series: [
+                Color::Rgb(211, 54, 255),  // electric purple
+                Color::Rgb(255, 113, 206), // hot pink
+                Color::Rgb(0, 240, 255),   // cyan
+                Color::Rgb(63, 240, 180),  // neon mint
+                Color::Rgb(255, 199, 95),  // gold
+                Color::Rgb(255, 66, 110),  // neon red
+            ],
+        }
+    }
+
+    /// Harvest: golden accent, olive/pumpkin health, warm autumnal chart palette.
+    fn harvest() -> Theme {
+        Theme {
+            name: "harvest",
+            ok: Color::Rgb(150, 168, 72),
+            warn: Color::Rgb(223, 146, 42),
+            crit: Color::Rgb(194, 58, 40),
+            border_ok: Color::Rgb(110, 92, 66),
+            accent: Color::Rgb(230, 175, 45),
+            rx: Color::Rgb(150, 168, 72),
+            tx: Color::Rgb(176, 98, 54),
+            muted: Color::Rgb(140, 118, 86),
+            series: [
+                Color::Rgb(230, 175, 45),  // gold
+                Color::Rgb(176, 98, 54),   // rust
+                Color::Rgb(194, 58, 40),   // deep red
+                Color::Rgb(150, 168, 72),  // olive
+                Color::Rgb(222, 196, 140), // wheat
+                Color::Rgb(120, 90, 60),   // bark
+            ],
+        }
+    }
+
     /// Look up a theme by its stable name. Unknown names return `None`.
     pub fn by_name(name: &str) -> Option<Theme> {
         match name {
@@ -171,6 +531,21 @@ impl Theme {
             "moss_goblin" => Some(Self::moss_goblin()),
             "cybercity_night" => Some(Self::cybercity_night()),
             "cottage_fire" => Some(Self::cottage_fire()),
+            "arctic_aurora" => Some(Self::arctic_aurora()),
+            "vaporwave" => Some(Self::vaporwave()),
+            "dracula" => Some(Self::dracula()),
+            "nord" => Some(Self::nord()),
+            "gruvbox" => Some(Self::gruvbox()),
+            "tokyo_night" => Some(Self::tokyo_night()),
+            "catppuccin" => Some(Self::catppuccin()),
+            "solarized_dark" => Some(Self::solarized_dark()),
+            "monokai" => Some(Self::monokai()),
+            "rose_pine" => Some(Self::rose_pine()),
+            "sakura" => Some(Self::sakura()),
+            "deep_ocean" => Some(Self::deep_ocean()),
+            "desert_dune" => Some(Self::desert_dune()),
+            "synthwave" => Some(Self::synthwave()),
+            "harvest" => Some(Self::harvest()),
             _ => None,
         }
     }
@@ -305,6 +680,38 @@ mod tests {
             "cottage_fire",
         ] {
             assert!(Theme::by_name(name).is_some(), "{name} should exist");
+        }
+    }
+
+    #[test]
+    fn catalog_has_twenty_themes() {
+        assert_eq!(Theme::NAMES.len(), 20);
+    }
+
+    #[test]
+    fn new_themes_exist() {
+        for name in [
+            // first expansion (5)
+            "arctic_aurora",
+            "vaporwave",
+            "dracula",
+            "nord",
+            "gruvbox",
+            // second expansion (10)
+            "tokyo_night",
+            "catppuccin",
+            "solarized_dark",
+            "monokai",
+            "rose_pine",
+            "sakura",
+            "deep_ocean",
+            "desert_dune",
+            "synthwave",
+            "harvest",
+        ] {
+            let t = Theme::by_name(name).unwrap_or_else(|| panic!("{name} missing"));
+            assert_eq!(t.name, name, "theme name must match its catalog key");
+            assert!(Theme::NAMES.contains(&name), "{name} must be in NAMES");
         }
     }
 
