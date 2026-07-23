@@ -24,8 +24,15 @@ pub enum Action {
     TogglePause,
     ClearEvents,
     ForceRefresh,
-    /// Advance to the next color theme (live cycle).
-    CycleTheme,
+    /// Open the theme picker overlay (browse + live-preview themes).
+    OpenThemePicker,
+    /// Move the picker selection to the previous/next theme, live-previewing it.
+    ThemePreviewUp,
+    ThemePreviewDown,
+    /// Keep the previewed theme and close the picker.
+    ThemePickerConfirm,
+    /// Revert to the theme active before opening and close the picker.
+    ThemePickerCancel,
     /// Toggle the keybinding help overlay.
     ToggleHelp,
     /// Scroll the events feed toward older / newer incidents.
@@ -147,11 +154,21 @@ pub struct RoutingState {
     health: Option<Debouncer>,
 }
 
+/// Live state of the theme-picker overlay (open only while `Some`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ThemePicker {
+    /// Index into [`Theme::NAMES`] of the highlighted (live-previewed) theme.
+    pub index: usize,
+    /// Theme active before the picker opened, restored on cancel.
+    original: Theme,
+}
+
 /// All dashboard state.
 #[derive(Debug, Clone)]
 pub struct AppState {
     pub config: Config,
-    /// Active color theme, resolved from `config.ui.theme` and cycled by [`Action::CycleTheme`].
+    /// Active color theme, resolved from `config.ui.theme` and chosen via the theme picker
+    /// ([`Action::OpenThemePicker`]).
     pub theme: Theme,
     pub targets: BTreeMap<String, TargetState>,
     pub resolvers: BTreeMap<String, ResolverState>,
@@ -173,6 +190,8 @@ pub struct AppState {
     pub events_scroll: usize,
     /// Whether the keybinding help overlay is showing.
     pub show_help: bool,
+    /// The theme picker overlay state, `Some` while open.
+    pub theme_picker: Option<ThemePicker>,
     pub paused: bool,
     pub should_quit: bool,
 }
@@ -198,6 +217,7 @@ impl AppState {
             max_events: 200,
             events_scroll: 0,
             show_help: false,
+            theme_picker: None,
             paused: false,
             should_quit: false,
             config,
@@ -679,7 +699,37 @@ impl AppState {
                 self.events_scroll = 0;
             }
             Action::ForceRefresh => {} // handled by the event loop (re-triggers probes)
-            Action::CycleTheme => self.theme = self.theme.next(),
+            Action::OpenThemePicker => {
+                if self.theme_picker.is_none() {
+                    let index = Theme::NAMES
+                        .iter()
+                        .position(|n| *n == self.theme.name)
+                        .unwrap_or(0);
+                    self.theme_picker = Some(ThemePicker {
+                        index,
+                        original: self.theme,
+                    });
+                    self.show_help = false; // don't stack overlays
+                }
+            }
+            Action::ThemePreviewUp => {
+                if let Some(p) = self.theme_picker.as_mut() {
+                    p.index = (p.index + Theme::NAMES.len() - 1) % Theme::NAMES.len();
+                    self.theme = Theme::resolve(Theme::NAMES[p.index]);
+                }
+            }
+            Action::ThemePreviewDown => {
+                if let Some(p) = self.theme_picker.as_mut() {
+                    p.index = (p.index + 1) % Theme::NAMES.len();
+                    self.theme = Theme::resolve(Theme::NAMES[p.index]);
+                }
+            }
+            Action::ThemePickerConfirm => self.theme_picker = None, // keep the previewed theme
+            Action::ThemePickerCancel => {
+                if let Some(p) = self.theme_picker.take() {
+                    self.theme = p.original;
+                }
+            }
             Action::ToggleHelp => self.show_help = !self.show_help,
             Action::ScrollUp => self.events_scroll = (self.events_scroll + 1).min(max_scroll),
             Action::ScrollDown => self.events_scroll = self.events_scroll.saturating_sub(1),
@@ -990,17 +1040,71 @@ mod tests {
     }
 
     #[test]
-    fn cycle_theme_advances_and_wraps() {
+    fn theme_picker_opens_at_current_theme() {
         let mut s = AppState::new(test_config());
-        assert_eq!(s.theme, Theme::default_theme());
-        s.apply_action(Action::CycleTheme);
-        assert_eq!(s.theme, Theme::default_theme().next());
-        assert_ne!(s.theme, Theme::default_theme());
-        // Cycling through the rest returns to the start.
+        let start = s.theme;
+        assert!(s.theme_picker.is_none());
+        s.apply_action(Action::OpenThemePicker);
+        let p = s.theme_picker.expect("picker should open");
+        assert_eq!(
+            Theme::NAMES[p.index],
+            start.name,
+            "opens at the active theme"
+        );
+        assert_eq!(s.theme, start, "opening does not change the theme");
+    }
+
+    #[test]
+    fn theme_picker_preview_changes_theme_live_and_wraps() {
+        let mut s = AppState::new(test_config());
+        let start = s.theme;
+        s.apply_action(Action::OpenThemePicker);
+        s.apply_action(Action::ThemePreviewDown);
+        assert_eq!(s.theme, start.next(), "down previews the next theme live");
+        // Wrap all the way around back to the start.
         for _ in 1..Theme::NAMES.len() {
-            s.apply_action(Action::CycleTheme);
+            s.apply_action(Action::ThemePreviewDown);
         }
-        assert_eq!(s.theme, Theme::default_theme());
+        assert_eq!(s.theme, start, "preview wraps back to the start");
+        // Step up to the first theme, then once more to confirm Up wraps to the last theme.
+        while s.theme.name != Theme::NAMES[0] {
+            s.apply_action(Action::ThemePreviewUp);
+        }
+        s.apply_action(Action::ThemePreviewUp);
+        assert_eq!(
+            s.theme.name,
+            *Theme::NAMES.last().unwrap(),
+            "up from the first theme wraps to the last"
+        );
+    }
+
+    #[test]
+    fn theme_picker_confirm_keeps_preview() {
+        let mut s = AppState::new(test_config());
+        let start = s.theme;
+        s.apply_action(Action::OpenThemePicker);
+        s.apply_action(Action::ThemePreviewDown);
+        let previewed = s.theme;
+        assert_ne!(previewed, start);
+        s.apply_action(Action::ThemePickerConfirm);
+        assert!(s.theme_picker.is_none(), "confirm closes the picker");
+        assert_eq!(s.theme, previewed, "confirm keeps the previewed theme");
+    }
+
+    #[test]
+    fn theme_picker_cancel_reverts_to_original() {
+        let mut s = AppState::new(test_config());
+        let start = s.theme;
+        s.apply_action(Action::OpenThemePicker);
+        s.apply_action(Action::ThemePreviewDown);
+        s.apply_action(Action::ThemePreviewDown);
+        assert_ne!(s.theme, start);
+        s.apply_action(Action::ThemePickerCancel);
+        assert!(s.theme_picker.is_none(), "cancel closes the picker");
+        assert_eq!(
+            s.theme, start,
+            "cancel reverts to the theme active before opening"
+        );
     }
 
     #[test]
