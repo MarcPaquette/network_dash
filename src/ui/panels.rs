@@ -1021,25 +1021,34 @@ pub fn events(frame: &mut Frame, area: Rect, state: &AppState) {
         .skip(state.events_scroll)
         .take(inner.height as usize)
         .map(|inc| {
-            let color = state.theme.health_color(inc.severity);
+            // An incident an upstream fault already explains is drawn entirely in the muted
+            // colour and indented under it. Still there to read — just not competing with
+            // the one line that says what to actually go and fix.
+            let muted = Style::default().fg(state.theme.muted);
+            let (glyph_style, text_style) = match inc.cause {
+                Some(_) => (muted, muted),
+                None => (
+                    Style::default().fg(state.theme.health_color(inc.severity)),
+                    Style::default(),
+                ),
+            };
             let mut spans = vec![
-                Span::styled(
-                    inc.ts.format("%H:%M:%S").to_string(),
-                    Style::default().fg(state.theme.muted),
-                ),
+                Span::styled(inc.ts.format("%H:%M:%S").to_string(), muted),
+                Span::raw(if inc.is_downstream() { "   " } else { " " }),
+                Span::styled(theme::health_symbol(inc.severity), glyph_style),
                 Span::raw(" "),
-                Span::styled(
-                    theme::health_symbol(inc.severity),
-                    Style::default().fg(color),
-                ),
-                Span::raw(" "),
-                Span::raw(inc.message.clone()),
+                Span::styled(inc.message.clone(), text_style),
             ];
             // Surface the threshold that was crossed — logged but previously never shown.
             if let Some(thr) = inc.threshold {
+                spans.push(Span::styled(format!("  · thr {thr:.0}{}", inc.unit), muted));
+            }
+            // Name the fault that accounts for it, so the dimming reads as an explanation
+            // rather than as the dashboard losing interest.
+            if let Some(cause) = inc.cause {
                 spans.push(Span::styled(
-                    format!("  · thr {thr:.0}{}", inc.unit),
-                    Style::default().fg(state.theme.muted),
+                    format!("  ↳ explained by {}", cause.tag()),
+                    muted,
                 ));
             }
             ListItem::new(Line::from(spans))
@@ -1069,7 +1078,9 @@ pub fn footer(frame: &mut Frame, area: Rect, state: &AppState) {
 mod tests {
     use super::*;
     use crate::config::Config;
+    use crate::diagnosis::Layer;
     use crate::health::Health;
+    use crate::incidents::Incident;
     use crate::metrics::{Hop, Sample};
     use crate::ui::theme::Theme;
     use chrono::{TimeZone, Utc};
@@ -1100,6 +1111,13 @@ mod tests {
             s.push('\n');
         }
         s
+    }
+
+    /// One row of a buffer as a string.
+    fn row_text(buf: &ratatui::buffer::Buffer, y: u16) -> String {
+        (0..buf.area().width)
+            .map(|x| buf[(x, y)].symbol())
+            .collect()
     }
 
     /// True if any cell holds a braille glyph — i.e. a line chart drew a line.
@@ -2316,6 +2334,74 @@ mod tests {
         let text = buffer_text(&term);
         assert!(text.contains("2.0 MB/s"), "text: {text}");
         assert!(text.contains("500.0 KB/s"));
+    }
+
+    #[test]
+    fn events_mark_a_downstream_incident_as_an_echo() {
+        let mut state = test_state();
+        let ts = Utc.with_ymd_and_hms(2026, 7, 20, 14, 0, 0).unwrap();
+        state.events.push_front(
+            Incident::new(ts, MetricId::Dns, Health::Crit, "dns timed out (system)")
+                .with_target("system")
+                .caused_by(Layer::Gateway),
+        );
+        let mut term = Terminal::new(TestBackend::new(120, 5)).unwrap();
+        term.draw(|f| events(f, f.area(), &state)).unwrap();
+        let text = buffer_text(&term);
+        assert!(
+            text.contains("dns timed out"),
+            "a downstream incident is dimmed, never dropped: {text}"
+        );
+        assert!(
+            text.to_lowercase().contains("gateway"),
+            "say what already explains it, or the dimming is a mystery: {text}"
+        );
+    }
+
+    #[test]
+    fn a_downstream_incident_is_dimmer_than_the_fault_that_caused_it() {
+        let mut state = test_state();
+        let ts = Utc.with_ymd_and_hms(2026, 7, 20, 14, 0, 0).unwrap();
+        // Newest first: the echo on row 0, the root cause on row 1.
+        state.events.push_front(
+            Incident::new(ts, MetricId::Loss, Health::Crit, "loss 100% (192.168.1.1)")
+                .with_target("192.168.1.1"),
+        );
+        state.events.push_front(
+            Incident::new(ts, MetricId::Dns, Health::Crit, "dns timed out (system)")
+                .caused_by(Layer::Gateway),
+        );
+        let mut term = Terminal::new(TestBackend::new(120, 5)).unwrap();
+        term.draw(|f| events(f, f.area(), &state)).unwrap();
+        let buf = term.backend().buffer();
+        assert!(
+            row_text(buf, 2).contains("loss 100%"),
+            "{}",
+            row_text(buf, 2)
+        );
+
+        // The severity glyph carries the alarm colour; the echo's must be muted instead.
+        let sym = theme::health_symbol(Health::Crit);
+        let glyph_at = |y: u16| {
+            (0..buf.area().width)
+                .find(|&x| buf[(x, y)].symbol() == sym)
+                .unwrap_or_else(|| panic!("no severity glyph on row {y}: {}", row_text(buf, y)))
+        };
+        let (echo_x, root_x) = (glyph_at(1), glyph_at(2));
+        assert_eq!(
+            buf[(root_x, 2)].fg,
+            state.theme.crit,
+            "the real fault stays loud"
+        );
+        assert_eq!(
+            buf[(echo_x, 1)].fg,
+            state.theme.muted,
+            "an echo of a known fault must not shout as loudly as the fault"
+        );
+        assert!(
+            echo_x > root_x,
+            "the echo should sit indented under the fault: {echo_x} vs {root_x}"
+        );
     }
 
     #[test]

@@ -11,6 +11,7 @@ use std::path::{Path, PathBuf};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
+use crate::diagnosis::Layer;
 use crate::health::Health;
 use crate::metrics::MetricId;
 
@@ -30,6 +31,14 @@ pub struct Incident {
     pub threshold: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub target: Option<String>,
+    /// The upstream layer that already accounts for this incident, when one does — a DNS
+    /// timeout during a gateway outage is an echo, not a second fault.
+    ///
+    /// Recorded, never used to drop the incident: the correlation is a judgement about the
+    /// state at one instant, and a log that quietly omits events is worse than a noisy one
+    /// when you are reading it back at 2am to work out what actually happened.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub cause: Option<Layer>,
     pub message: String,
 }
 
@@ -48,6 +57,7 @@ impl Incident {
             unit: String::new(),
             threshold: None,
             target: None,
+            cause: None,
             message: message.into(),
         }
     }
@@ -66,6 +76,17 @@ impl Incident {
     pub fn with_target(mut self, target: impl Into<String>) -> Self {
         self.target = Some(target.into());
         self
+    }
+
+    /// Mark this incident as already explained by a fault at `layer`.
+    pub fn caused_by(mut self, layer: Layer) -> Self {
+        self.cause = Some(layer);
+        self
+    }
+
+    /// Whether an upstream fault already accounts for this incident.
+    pub fn is_downstream(&self) -> bool {
+        self.cause.is_some()
     }
 
     /// Serialize to a single JSONL line terminated with `\n`.
@@ -240,6 +261,29 @@ mod tests {
         let line = inc.to_jsonl_line().unwrap();
         let parsed = Incident::from_jsonl_line(&line).unwrap();
         assert_eq!(parsed, inc);
+    }
+
+    #[test]
+    fn a_cause_round_trips_and_is_absent_unless_correlated() {
+        let plain = sample();
+        assert_eq!(plain.cause, None);
+        assert!(
+            !plain.to_jsonl_line().unwrap().contains("cause"),
+            "an uncorrelated incident must not carry an empty field"
+        );
+
+        let caused = sample().caused_by(Layer::Gateway);
+        let line = caused.to_jsonl_line().unwrap();
+        assert!(line.contains("\"cause\":\"gateway\""), "got: {line}");
+        assert_eq!(Incident::from_jsonl_line(&line).unwrap(), caused);
+    }
+
+    #[test]
+    fn a_line_written_before_correlation_existed_still_parses() {
+        let line =
+            r#"{"ts":"2026-07-20T14:20:03Z","metric":"dns","severity":"warn","message":"x"}"#;
+        let inc = Incident::from_jsonl_line(line).expect("old logs must keep loading");
+        assert_eq!(inc.cause, None);
     }
 
     #[test]

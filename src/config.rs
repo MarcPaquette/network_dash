@@ -18,6 +18,7 @@ pub struct Config {
     pub cadence: Cadence,
     pub thresholds: ThresholdConfig,
     pub throughput: ThroughputConfig,
+    pub alerts: AlertConfig,
     pub ui: UiConfig,
     /// Deprecated keys found in the loaded file, for the caller to report. Not part of the
     /// schema: it describes the file that was read, not a setting, so it neither
@@ -34,6 +35,7 @@ impl Default for Config {
             cadence: Cadence::default(),
             thresholds: ThresholdConfig::default(),
             throughput: ThroughputConfig::default(),
+            alerts: AlertConfig::default(),
             ui: UiConfig::default(),
             deprecated_keys: Vec::new(),
         }
@@ -206,6 +208,51 @@ impl ThresholdConfig {
 /// that cannot surprise anyone.
 fn secs_to_duration(secs: f64) -> chrono::Duration {
     chrono::Duration::milliseconds((secs.max(0.0) * 1000.0) as i64)
+}
+
+/// Noise controls for the event feed and the incident log.
+///
+/// These sit downstream of the debounce: debouncing decides whether a change is *real*,
+/// these decide whether reporting it again tells the reader anything new.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AlertConfig {
+    /// Committed transitions within `flap_window_secs` before a metric is called unstable
+    /// and its individual swings are collapsed into one "flapping" incident. Below 2 the
+    /// detector is disabled — every transition would qualify and nothing would be reported.
+    pub flap_count: usize,
+    /// The window flap transitions are counted over, in seconds.
+    pub flap_window_secs: f64,
+    /// Drop an incident identical to one already reported (same metric, target and
+    /// severity) within this many seconds. A short-range backstop for anything that raises
+    /// alerts on edges rather than on debounced state.
+    ///
+    /// Kept below `trip_after_secs + clear_after_secs` on purpose: a debounced metric cannot
+    /// break, recover and break again faster than that, so the cooldown can only ever
+    /// swallow a true duplicate — never a second, genuine failure.
+    pub dedup_secs: f64,
+}
+
+impl Default for AlertConfig {
+    fn default() -> Self {
+        Self {
+            flap_count: 4,
+            flap_window_secs: 120.0,
+            dedup_secs: 10.0,
+        }
+    }
+}
+
+impl AlertConfig {
+    /// Window flap transitions are counted over.
+    pub fn flap_window(&self) -> chrono::Duration {
+        secs_to_duration(self.flap_window_secs)
+    }
+
+    /// Cooldown before an identical alert may be reported again.
+    pub fn dedup_window(&self) -> chrono::Duration {
+        secs_to_duration(self.dedup_secs)
+    }
 }
 
 /// Throughput probe settings.
@@ -429,6 +476,45 @@ mod tests {
         .unwrap();
         assert_eq!(c.thresholds.throughput.warn, 500.0);
         assert_eq!(c.thresholds.throughput.crit, 100.0);
+    }
+
+    #[test]
+    fn alert_defaults_collapse_noise_without_silencing_the_feed() {
+        let a = Config::default().alerts;
+        assert!(
+            a.flap_count >= 2,
+            "under 2 would call every single transition a flap and mute everything"
+        );
+        assert!(a.flap_window_secs > 0.0);
+        assert!(
+            a.dedup_secs > 0.0 && a.dedup_secs < a.flap_window_secs,
+            "dedup is the short-range backstop, flap detection the long one: {a:?}"
+        );
+        let t = Config::default().thresholds;
+        assert!(
+            a.dedup_secs < t.trip_after_secs + t.clear_after_secs,
+            "a debounced metric can't round-trip faster than trip+clear, so a longer \
+             cooldown than that would swallow a genuine second failure: {a:?}"
+        );
+        assert_eq!(
+            a.flap_window(),
+            chrono::Duration::seconds(a.flap_window_secs as i64)
+        );
+        assert_eq!(
+            a.dedup_window(),
+            chrono::Duration::seconds(a.dedup_secs as i64)
+        );
+    }
+
+    #[test]
+    fn alerts_are_configurable_and_partial() {
+        let c = Config::from_toml_str("[alerts]\nflap_count = 9\n").unwrap();
+        assert_eq!(c.alerts.flap_count, 9);
+        assert_eq!(
+            c.alerts.flap_window_secs,
+            Config::default().alerts.flap_window_secs,
+            "omitted siblings keep their defaults"
+        );
     }
 
     #[test]

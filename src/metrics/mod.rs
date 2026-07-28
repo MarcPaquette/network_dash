@@ -18,7 +18,7 @@ pub mod routing;
 pub mod throughput;
 
 /// Stable identifier for each dashboard section / metric family.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MetricId {
     Latency,

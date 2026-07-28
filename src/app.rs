@@ -10,8 +10,9 @@ use std::collections::{BTreeMap, VecDeque};
 
 use chrono::{DateTime, Timelike, Utc};
 
-use crate::config::Config;
-use crate::health::{Debouncer, Health, Thresholds};
+use crate::config::{AlertConfig, Config};
+use crate::diagnosis::Layer;
+use crate::health::{Debouncer, FlapDetector, Health, Thresholds};
 use crate::history::{LossWindow, RingBuffer, Series};
 use crate::incidents::Incident;
 use crate::metrics::{Hop, MetricId, Sample};
@@ -205,6 +206,9 @@ pub struct AppState {
     pub routing: RoutingState,
     /// Whether a captive portal is currently intercepting web traffic.
     pub captive_portal: bool,
+    /// Debounce for the captive-portal verdict, so one intercepted request can't put
+    /// "sign-in required" on screen. Lazily built to pick up config at first sample.
+    captive_health: Option<Debouncer>,
     /// Public/WAN IP (from the public-IP probe), for ISP/WAN-change detection.
     pub public_ip: Option<String>,
     /// Default-route interface, its MTU, and whether it runs over a VPN.
@@ -213,6 +217,12 @@ pub struct AppState {
     pub vpn: bool,
     pub events: VecDeque<Incident>,
     pub max_events: usize,
+    /// Instability bookkeeping, one entry per (metric, target) that has ever transitioned.
+    /// A `BTreeMap` rather than a hash map so the settle incidents a single fold emits come
+    /// out in the same order every run.
+    flaps: BTreeMap<(MetricId, String), FlapState>,
+    /// When each (metric, target, severity) was last reported, for the dedup cooldown.
+    recent_alerts: BTreeMap<(MetricId, String, Health), DateTime<Utc>>,
     /// First incident-log write failure, kept so the header can say the on-disk history is
     /// no longer being recorded. `None` means the log is healthy (or was never opened).
     pub log_error: Option<String>,
@@ -242,12 +252,15 @@ impl AppState {
             link: LinkState::default(),
             routing: RoutingState::default(),
             captive_portal: false,
+            captive_health: None,
             public_ip: None,
             interface: None,
             mtu: None,
             vpn: false,
             events: VecDeque::new(),
             max_events: 200,
+            flaps: BTreeMap::new(),
+            recent_alerts: BTreeMap::new(),
             log_error: None,
             availability: RingBuffer::new(AVAILABILITY_MINUTES),
             events_scroll: 0,
@@ -279,7 +292,7 @@ impl AppState {
     /// Fold one sample into state, returning any incidents produced by the update. Emitted
     /// incidents are also appended to the in-memory `events` ring.
     pub fn apply_sample(&mut self, now: DateTime<Utc>, sample: Sample) -> Vec<Incident> {
-        let incidents = match sample {
+        let mut incidents = match sample {
             Sample::Latency { target, rtt_ms } => self.apply_latency(now, &target, rtt_ms),
             Sample::Dns {
                 resolver,
@@ -310,6 +323,8 @@ impl AppState {
                 detail,
             } => self.apply_routing(now, &target, hops, reachable, changed, detail),
         };
+        self.attribute(&mut incidents);
+        let incidents = self.filter_noise(now, incidents);
         for inc in &incidents {
             self.push_event(inc.clone());
         }
@@ -318,6 +333,122 @@ impl AppState {
         // nothing ever renders.
         self.tick(now);
         incidents
+    }
+
+    /// Tag each newly-raised incident with the upstream layer that already accounts for it.
+    ///
+    /// Runs *after* the handler has folded the sample in, so the attribution reflects the
+    /// state the incident was born into rather than the one before it. Nothing is dropped —
+    /// the tag only tells the UI to render the echo quietly (see [`Incident::cause`]).
+    ///
+    /// Recoveries are left alone: a metric coming back is its own news whatever else is
+    /// still broken, and dimming it would hide the one line that says things are improving.
+    fn attribute(&self, incidents: &mut [Incident]) {
+        if !incidents.iter().any(|i| i.severity > Health::Ok) {
+            return;
+        }
+        // One diagnose() per fold that raised something, never one per incident: the ruleset
+        // walks every target and resolver, and nothing about it moves between two incidents
+        // out of the same sample.
+        let Some(primary) = crate::diagnosis::primary_layer(self) else {
+            return;
+        };
+        for inc in incidents.iter_mut().filter(|i| i.severity > Health::Ok) {
+            if self
+                .incident_layer(inc)
+                .is_some_and(|l| primary.explains(l))
+            {
+                inc.cause = Some(primary);
+            }
+        }
+    }
+
+    /// Collapse the noise out of a fold's incidents before they reach the feed and the log.
+    ///
+    /// Two independent mechanisms, deliberately kept apart because they answer different
+    /// questions at different ranges. Flap detection is long-range and about *a metric*: once
+    /// one has swung too often it stops reporting the swings and reports the instability
+    /// instead. Dedup is short-range and about *an alert*: the identical line, twice, inside a
+    /// few seconds, is once.
+    ///
+    /// Correlated incidents are deliberately left in — [`attribute`](Self::attribute) already
+    /// decided the right treatment for those is to dim them, not to drop them.
+    fn filter_noise(&mut self, now: DateTime<Utc>, incidents: Vec<Incident>) -> Vec<Incident> {
+        let alerts = self.config.alerts.clone();
+        let mut out = Vec::new();
+
+        // Age out swings across *every* tracked metric, not just the one this fold touched:
+        // settling happens through the passage of time, and a metric that has gone quiet has
+        // no samples of its own left to notice it with.
+        for (key, st) in self.flaps.iter_mut() {
+            if st.detector.observe(now, false) == Some(false) {
+                out.push(settle_incident(now, key, st.last_suppressed.take()));
+            }
+        }
+
+        for inc in incidents {
+            let key = (inc.metric, inc.target.clone().unwrap_or_default());
+            let st = self
+                .flaps
+                .entry(key.clone())
+                .or_insert_with(|| FlapState::new(&alerts));
+            match st.detector.observe(now, true) {
+                Some(true) => out.push(flapping_incident(now, &key, &st.detector, &alerts)),
+                _ if st.detector.is_flapping() => {
+                    // Held back, not discarded: when the metric settles this is what says
+                    // where it actually ended up.
+                    st.last_suppressed = Some(inc);
+                }
+                _ => out.push(inc),
+            }
+        }
+
+        let cooldown = alerts.dedup_window();
+        out.retain(|inc| {
+            let key = (
+                inc.metric,
+                inc.target.clone().unwrap_or_default(),
+                inc.severity,
+            );
+            match self.recent_alerts.get(&key) {
+                // `last <= now` guards a clock corrected backwards, which would otherwise
+                // leave a future timestamp suppressing the metric until it caught up.
+                Some(&last) if last <= now && now.signed_duration_since(last) < cooldown => false,
+                _ => {
+                    self.recent_alerts.insert(key, now);
+                    true
+                }
+            }
+        });
+        // An entry older than the cooldown can never suppress anything again, so the table
+        // stays bounded by the number of metrics alerting inside one window.
+        self.recent_alerts
+            .retain(|_, t| *t <= now && now.signed_duration_since(*t) < cooldown);
+        out
+    }
+
+    /// Which segment of the path an incident is a symptom of.
+    ///
+    /// Ping metrics against a non-gateway target map to the ISP rather than to
+    /// [`Layer::Remote`], even though a single bad host is a remote problem: those pings are
+    /// the *evidence* for an ISP verdict, and an incident must never be dimmed by the
+    /// conclusion it produced. `None` leaves the incident uncorrelated.
+    fn incident_layer(&self, inc: &Incident) -> Option<Layer> {
+        match inc.metric {
+            MetricId::Latency | MetricId::Loss | MetricId::Jitter => {
+                let gateway = inc
+                    .target
+                    .as_ref()
+                    .and_then(|t| self.targets.get(t))
+                    .is_some_and(|t| t.is_gateway);
+                Some(if gateway { Layer::Gateway } else { Layer::Isp })
+            }
+            MetricId::Link => Some(Layer::Wifi),
+            MetricId::Reachability | MetricId::Routing | MetricId::Throughput => Some(Layer::Isp),
+            MetricId::Dns => Some(Layer::Dns),
+            // The dashboard complaining about its own log has no place on the network.
+            MetricId::Log => None,
+        }
     }
 
     /// Advance the availability strip to `now`.
@@ -654,11 +785,19 @@ impl AppState {
     }
 
     fn apply_captive(&mut self, now: DateTime<Utc>, detected: bool) -> Vec<Incident> {
-        let changed = self.captive_portal != detected;
-        self.captive_portal = detected;
-        if !changed {
+        let cfg = self.config.thresholds.clone();
+        // Debounced like every other verdict: a single intercepted request is as likely to be
+        // a flaky proxy as a portal, and "sign-in required" is an expensive thing to be wrong
+        // about — it sends the user to a browser instead of at the actual fault.
+        let raw = if detected { Health::Crit } else { Health::Ok };
+        let debouncer = self
+            .captive_health
+            .get_or_insert_with(|| Debouncer::new(Health::Ok, cfg.trip_after(), cfg.clear_after()));
+        let Some(committed) = debouncer.update(now, raw) else {
             return Vec::new();
-        }
+        };
+        let detected = committed > Health::Ok;
+        self.captive_portal = detected;
         let (sev, msg) = if detected {
             (
                 Health::Crit,
@@ -976,6 +1115,73 @@ impl AppState {
     }
 }
 
+/// Instability bookkeeping for one (metric, target).
+#[derive(Debug, Clone)]
+struct FlapState {
+    detector: FlapDetector,
+    /// The most recent transition held back while flapping, re-reported on settle so the feed
+    /// says where the metric actually landed rather than just going quiet.
+    last_suppressed: Option<Incident>,
+}
+
+impl FlapState {
+    fn new(alerts: &AlertConfig) -> Self {
+        Self {
+            detector: FlapDetector::new(alerts.flap_count, alerts.flap_window()),
+            last_suppressed: None,
+        }
+    }
+}
+
+/// The one line that stands in for a burst of individual swings.
+///
+/// `Warn`, never `Crit`, whichever way the metric happens to be pointing as it trips: this
+/// says "you can't trust this reading", which is a different and lesser claim than "this is
+/// down". The swing that mattered is reported on its own when the metric settles.
+fn flapping_incident(
+    now: DateTime<Utc>,
+    key: &(MetricId, String),
+    detector: &FlapDetector,
+    alerts: &AlertConfig,
+) -> Incident {
+    let (metric, target) = key;
+    let message = format!(
+        "{} flapping ({target}): {} changes in {:.0}s",
+        metric.label(),
+        detector.recent(),
+        alerts.flap_window_secs,
+    );
+    status_incident(now, *metric, target, Health::Warn, message)
+}
+
+/// Closes out a flapping episode by reporting the swing that was held back last, re-stamped
+/// at the moment the metric went quiet.
+///
+/// `last` is `None` when nothing was suppressed — the detector tripped on the very transition
+/// that was reported as "flapping", and nothing came after it. There is no landing state to
+/// report in that case, only the fact that the noise stopped.
+fn settle_incident(
+    now: DateTime<Utc>,
+    key: &(MetricId, String),
+    last: Option<Incident>,
+) -> Incident {
+    let (metric, target) = key;
+    match last {
+        Some(inc) => Incident {
+            ts: now,
+            message: format!("{} · settled after flapping", inc.message),
+            ..inc
+        },
+        None => status_incident(
+            now,
+            *metric,
+            target,
+            Health::Ok,
+            format!("{} stopped flapping ({target})", metric.label()),
+        ),
+    }
+}
+
 /// Build an incident for a boolean/status metric transition (no scalar threshold).
 fn status_incident(
     now: DateTime<Utc>,
@@ -1016,6 +1222,7 @@ fn incident_for(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::diagnosis::Layer;
     use chrono::TimeZone;
     use pretty_assertions::assert_eq;
 
@@ -1393,6 +1600,306 @@ mod tests {
         assert_eq!(s.panel_health(MetricId::Latency), Health::Ok);
     }
 
+    // --- root-cause attribution ---
+
+    /// Config with a gateway registered, so faults can be localized to the LAN.
+    fn gateway_config() -> Config {
+        let mut c = test_config();
+        c.targets.gateway = Some("192.168.1.1".into());
+        c.targets.gateway_auto = false;
+        c
+    }
+
+    fn dns_timeout(resolver: &str) -> Sample {
+        Sample::Dns {
+            resolver: resolver.into(),
+            latency_ms: None,
+        }
+    }
+
+    #[test]
+    fn a_dns_failure_behind_a_dead_gateway_is_marked_as_downstream() {
+        let mut s = AppState::new(gateway_config());
+        let mut c = Clock::new();
+        for _ in 0..3 {
+            s.apply_sample(c.tick(), timeout("192.168.1.1"));
+        }
+        assert_eq!(crate::diagnosis::primary_layer(&s), Some(Layer::Gateway));
+
+        let mut raised = Vec::new();
+        for _ in 0..3 {
+            raised.extend(s.apply_sample(c.tick(), dns_timeout("system")));
+        }
+        let dns = raised
+            .iter()
+            .find(|i| i.metric == MetricId::Dns && i.severity > Health::Ok)
+            .expect("a failing resolver must still be logged");
+        assert_eq!(
+            dns.cause,
+            Some(Layer::Gateway),
+            "DNS can't work through a dead gateway — this is an echo, not a second fault"
+        );
+    }
+
+    #[test]
+    fn the_root_cause_itself_is_never_marked_as_downstream() {
+        let mut s = AppState::new(gateway_config());
+        let mut c = Clock::new();
+        let mut raised = Vec::new();
+        for _ in 0..3 {
+            raised.extend(s.apply_sample(c.tick(), timeout("192.168.1.1")));
+        }
+        assert!(
+            !raised.is_empty(),
+            "the gateway going down must be reported"
+        );
+        for inc in &raised {
+            assert_eq!(
+                inc.cause, None,
+                "the fault to fix must not be dimmed: {inc:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_dns_failure_on_an_otherwise_healthy_network_stands_on_its_own() {
+        let mut s = AppState::new(gateway_config());
+        let mut c = Clock::new();
+        for _ in 0..3 {
+            s.apply_sample(c.tick(), latency("192.168.1.1", 2.0));
+            s.apply_sample(c.tick(), latency("1.1.1.1", 20.0));
+        }
+        let mut raised = Vec::new();
+        for _ in 0..3 {
+            raised.extend(s.apply_sample(c.tick(), dns_timeout("system")));
+        }
+        let dns = raised
+            .iter()
+            .find(|i| i.metric == MetricId::Dns)
+            .expect("a failing resolver must be logged");
+        assert_eq!(dns.cause, None, "nothing upstream is broken: {dns:?}");
+    }
+
+    #[test]
+    fn internet_latency_is_not_dimmed_by_the_verdict_it_is_the_evidence_for() {
+        // All internet hosts degrade -> the diagnosis blames the ISP. The pings that proved
+        // it must stay legible; dimming them hides the only numbers on screen.
+        let mut cfg = gateway_config();
+        cfg.targets.internet = vec!["1.1.1.1".into(), "8.8.8.8".into()];
+        let mut s = AppState::new(cfg);
+        let mut c = Clock::new();
+        let mut raised = Vec::new();
+        for _ in 0..3 {
+            s.apply_sample(c.tick(), latency("192.168.1.1", 2.0));
+            raised.extend(s.apply_sample(c.tick(), latency("1.1.1.1", 400.0)));
+            raised.extend(s.apply_sample(c.tick(), latency("8.8.8.8", 400.0)));
+        }
+        assert!(!raised.is_empty());
+        for inc in &raised {
+            assert_eq!(inc.cause, None, "{inc:?}");
+        }
+    }
+
+    #[test]
+    fn a_recovery_is_never_attributed_to_an_upstream_fault() {
+        let mut s = AppState::new(gateway_config());
+        let mut c = Clock::new();
+        // DNS fails, then comes back, all while the gateway stays down.
+        for _ in 0..3 {
+            s.apply_sample(c.tick(), timeout("192.168.1.1"));
+            s.apply_sample(c.tick(), dns_timeout("system"));
+        }
+        let mut raised = Vec::new();
+        for _ in 0..3 {
+            s.apply_sample(c.tick(), timeout("192.168.1.1"));
+            raised.extend(s.apply_sample(
+                c.tick(),
+                Sample::Dns {
+                    resolver: "system".into(),
+                    latency_ms: Some(12.0),
+                },
+            ));
+        }
+        let rec = raised
+            .iter()
+            .find(|i| i.metric == MetricId::Dns && i.severity == Health::Ok)
+            .expect("DNS coming back must be reported");
+        assert_eq!(
+            rec.cause, None,
+            "a metric recovering is its own news, whatever else is broken"
+        );
+    }
+
+    // --- alert noise ---
+
+    /// Feed `n` samples of `make`, collecting whatever they raise.
+    fn drive(
+        s: &mut AppState,
+        c: &mut Clock,
+        n: usize,
+        make: impl Fn() -> Sample,
+    ) -> Vec<Incident> {
+        (0..n)
+            .flat_map(|_| s.apply_sample(c.tick(), make()))
+            .collect()
+    }
+
+    /// A config whose flap detector trips on 4 swings in 10s — the same shape as the
+    /// defaults, scaled to the 1s-per-sample test [`Clock`].
+    fn flappy_config() -> Config {
+        let mut c = test_config();
+        c.alerts.flap_count = 4;
+        c.alerts.flap_window_secs = 10.0;
+        c.alerts.dedup_secs = 0.0;
+        c
+    }
+
+    /// Swing latency bad→good `cycles` times; each half commits one transition.
+    fn swing(s: &mut AppState, c: &mut Clock, cycles: usize) -> Vec<Incident> {
+        let mut out = Vec::new();
+        for _ in 0..cycles {
+            out.extend(drive(s, c, 2, || latency("1.1.1.1", 400.0)));
+            out.extend(drive(s, c, 2, || latency("1.1.1.1", 10.0)));
+        }
+        out
+    }
+
+    #[test]
+    fn a_metric_that_keeps_changing_its_mind_is_reported_unstable_once() {
+        let mut s = AppState::new(flappy_config());
+        let mut c = Clock::new();
+        let raised = swing(&mut s, &mut c, 6);
+        let flapping: Vec<_> = raised
+            .iter()
+            .filter(|i| i.message.contains("flapping"))
+            .collect();
+        assert_eq!(flapping.len(), 1, "say it once, not per swing: {raised:#?}");
+        assert_eq!(
+            raised.len(),
+            4,
+            "three real swings, then one 'this is unstable' standing in for the other nine: \
+             {raised:#?}"
+        );
+        assert_eq!(flapping[0].metric, MetricId::Latency);
+        assert_eq!(flapping[0].target.as_deref(), Some("1.1.1.1"));
+    }
+
+    #[test]
+    fn a_settled_metric_reports_where_it_actually_landed() {
+        let mut s = AppState::new(flappy_config());
+        let mut c = Clock::new();
+        swing(&mut s, &mut c, 6);
+        // Leave it bad, then go quiet for longer than the flap window.
+        let tail = drive(&mut s, &mut c, 14, || latency("1.1.1.1", 400.0));
+        assert_eq!(tail.len(), 1, "one line closes it out: {tail:#?}");
+        assert_eq!(
+            tail[0].severity,
+            Health::Crit,
+            "the noise stopped with latency still broken; saying 'ok' would be a lie: {:?}",
+            tail[0]
+        );
+        assert!(
+            tail[0].message.contains("settled"),
+            "explain why this line is appearing now: {:?}",
+            tail[0]
+        );
+    }
+
+    #[test]
+    fn a_metric_that_settles_can_be_reported_normally_again() {
+        let mut s = AppState::new(flappy_config());
+        let mut c = Clock::new();
+        swing(&mut s, &mut c, 6);
+        drive(&mut s, &mut c, 14, || latency("1.1.1.1", 10.0)); // quiet, healthy
+        let again = drive(&mut s, &mut c, 2, || latency("1.1.1.1", 400.0));
+        assert_eq!(
+            again.len(),
+            1,
+            "suppression must not be permanent: {again:#?}"
+        );
+        assert_eq!(again[0].severity, Health::Crit);
+        assert!(!again[0].message.contains("flapping"), "{:?}", again[0]);
+    }
+
+    #[test]
+    fn a_steady_metric_is_never_called_unstable() {
+        let mut s = AppState::new(flappy_config());
+        let mut c = Clock::new();
+        // One clean break, then a long healthy stretch: two transitions, well spread.
+        let mut raised = drive(&mut s, &mut c, 4, || latency("1.1.1.1", 400.0));
+        raised.extend(drive(&mut s, &mut c, 30, || latency("1.1.1.1", 10.0)));
+        assert!(
+            raised.iter().all(|i| !i.message.contains("flapping")),
+            "a link that broke once and recovered is not thrashing: {raised:#?}"
+        );
+        assert_eq!(raised.len(), 2, "{raised:#?}");
+    }
+
+    #[test]
+    fn an_identical_alert_inside_the_cooldown_is_dropped() {
+        // The dedup backstop works on the incidents themselves, so it can be exercised
+        // without a probe that alerts on edges: push the same transition twice.
+        let mut cfg = test_config();
+        cfg.alerts.dedup_secs = 10.0;
+        cfg.alerts.flap_count = 0; // one mechanism at a time
+        let mut s = AppState::new(cfg);
+        let t = now();
+        let inc = || {
+            vec![
+                status_incident(t, MetricId::Reachability, "wan", Health::Warn, "x".into()),
+                status_incident(t, MetricId::Reachability, "wan", Health::Warn, "x".into()),
+            ]
+        };
+        let out = s.filter_noise(t, inc());
+        assert_eq!(out.len(), 1, "the same news twice is once: {out:#?}");
+        // ...and still dropped on a later fold inside the cooldown.
+        assert!(
+            s.filter_noise(t + chrono::Duration::seconds(5), inc())
+                .is_empty()
+        );
+        // Past the cooldown it is news again.
+        let later = s.filter_noise(t + chrono::Duration::seconds(11), inc());
+        assert_eq!(later.len(), 1, "{later:#?}");
+    }
+
+    #[test]
+    fn a_single_intercepted_request_does_not_announce_a_captive_portal() {
+        let mut s = AppState::new(test_config());
+        let mut c = Clock::new();
+        let blip = s.apply_sample(c.tick(), Sample::CaptivePortal { detected: true });
+        assert!(
+            blip.is_empty(),
+            "one bad HTTP response is not a portal: {blip:#?}"
+        );
+        assert!(
+            !s.captive_portal,
+            "and the diagnosis must not claim one either"
+        );
+        let confirmed = s.apply_sample(c.tick(), Sample::CaptivePortal { detected: true });
+        assert_eq!(
+            confirmed.len(),
+            1,
+            "a portal that persists is real: {confirmed:#?}"
+        );
+        assert_eq!(confirmed[0].severity, Health::Crit);
+        assert!(s.captive_portal);
+    }
+
+    #[test]
+    fn a_captive_portal_clears_once_the_interception_stops() {
+        let mut s = AppState::new(test_config());
+        let mut c = Clock::new();
+        drive(&mut s, &mut c, 2, || Sample::CaptivePortal {
+            detected: true,
+        });
+        let cleared = drive(&mut s, &mut c, 2, || Sample::CaptivePortal {
+            detected: false,
+        });
+        assert_eq!(cleared.len(), 1, "{cleared:#?}");
+        assert_eq!(cleared[0].severity, Health::Ok);
+        assert!(!s.captive_portal);
+    }
+
     #[test]
     fn recovery_is_slower_to_commit_than_the_fault_was() {
         let mut cfg = test_config();
@@ -1712,20 +2219,26 @@ mod tests {
         );
         assert!(!s.captive_portal);
 
-        // Detecting a portal flips the state and logs a crit incident.
-        let hit = s.apply_sample(c.tick(), Sample::CaptivePortal { detected: true });
+        // A portal that persists past the trip dwell flips the state and logs a crit.
+        let hit = drive(&mut s, &mut c, 2, || Sample::CaptivePortal {
+            detected: true,
+        });
         assert!(s.captive_portal);
         assert_eq!(hit.len(), 1);
         assert_eq!(hit[0].severity, Health::Crit);
 
-        // A steady portal reading does not re-log.
+        // Steady portal readings after that do not re-log.
         assert!(
-            s.apply_sample(c.tick(), Sample::CaptivePortal { detected: true })
-                .is_empty()
+            drive(&mut s, &mut c, 3, || Sample::CaptivePortal {
+                detected: true
+            })
+            .is_empty()
         );
 
         // Clearing flips back and logs recovery.
-        let cleared = s.apply_sample(c.tick(), Sample::CaptivePortal { detected: false });
+        let cleared = drive(&mut s, &mut c, 2, || Sample::CaptivePortal {
+            detected: false,
+        });
         assert!(!s.captive_portal);
         assert_eq!(cleared.len(), 1);
         assert_eq!(cleared[0].severity, Health::Ok);

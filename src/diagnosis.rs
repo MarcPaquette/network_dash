@@ -7,11 +7,14 @@
 //! ([`diagnose_signals`]) is a pure function of `Signals`, so each rule is unit-tested by
 //! constructing `Signals` directly rather than driving the whole reducer.
 
+use serde::{Deserialize, Serialize};
+
 use crate::app::AppState;
 use crate::health::Health;
 
 /// The network segment a fault localizes to.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum Layer {
     /// Local wireless radio (weak signal / bad SNR).
     Wifi,
@@ -35,6 +38,26 @@ impl Layer {
             Layer::Dns => "DNS",
             Layer::Remote => "REMOTE",
         }
+    }
+
+    /// How far down the path from you the layer sits. Faults propagate one way: a dead radio
+    /// makes every hop past it look broken, and nothing past it can break the radio.
+    ///
+    /// DNS and a single bad remote host share a rank — both live past the ISP, on branches
+    /// that don't touch each other.
+    fn distance(self) -> u8 {
+        match self {
+            Layer::Wifi => 0,
+            Layer::Gateway => 1,
+            Layer::Isp => 2,
+            Layer::Dns | Layer::Remote => 3,
+        }
+    }
+
+    /// Whether a fault here would account for a symptom reported at `other` — the test for
+    /// "this alert is an echo of the one above it, not news".
+    pub fn explains(self, other: Layer) -> bool {
+        self.distance() < other.distance()
     }
 }
 
@@ -212,6 +235,24 @@ impl Signals {
 /// Never empty — an all-healthy state yields a single `Ok` "No problems detected" verdict.
 pub fn diagnose(state: &AppState) -> Vec<Diagnosis> {
     diagnose_signals(&Signals::from_state(state))
+}
+
+/// The layer to blame for whatever is worst right now — the one thing worth fixing first.
+/// `None` when nothing is wrong, or when the worst verdict doesn't localize.
+///
+/// This is deliberately a *reading* of [`diagnose`] rather than a second ruleset: the moment
+/// two correlation engines exist they disagree, and the panel and the event feed start
+/// telling the user different stories about the same outage.
+pub fn primary_layer(state: &AppState) -> Option<Layer> {
+    primary_of(&diagnose(state))
+}
+
+/// The blamed layer of the worst verdict in an already-sorted list.
+fn primary_of(verdicts: &[Diagnosis]) -> Option<Layer> {
+    verdicts
+        .iter()
+        .find(|d| d.severity > Health::Ok)
+        .and_then(|d| d.layer)
 }
 
 /// The pure ruleset over a [`Signals`] snapshot.
@@ -617,6 +658,62 @@ mod tests {
                 "not worst-first: {d:?}"
             );
         }
+    }
+
+    // --- root-cause ordering ---
+
+    const ALL_LAYERS: [Layer; 5] = [
+        Layer::Wifi,
+        Layer::Gateway,
+        Layer::Isp,
+        Layer::Dns,
+        Layer::Remote,
+    ];
+
+    #[test]
+    fn an_upstream_fault_explains_a_downstream_symptom() {
+        assert!(Layer::Wifi.explains(Layer::Gateway));
+        assert!(Layer::Wifi.explains(Layer::Dns));
+        assert!(Layer::Gateway.explains(Layer::Isp));
+        assert!(Layer::Isp.explains(Layer::Dns));
+        assert!(Layer::Isp.explains(Layer::Remote));
+    }
+
+    #[test]
+    fn a_downstream_fault_never_explains_its_upstream() {
+        assert!(!Layer::Dns.explains(Layer::Isp));
+        assert!(!Layer::Isp.explains(Layer::Gateway));
+        assert!(!Layer::Remote.explains(Layer::Wifi));
+        assert!(!Layer::Gateway.explains(Layer::Wifi));
+    }
+
+    #[test]
+    fn a_layer_does_not_explain_itself() {
+        for l in ALL_LAYERS {
+            assert!(!l.explains(l), "{l:?} explaining itself is circular");
+        }
+    }
+
+    #[test]
+    fn layers_at_the_same_distance_do_not_explain_each_other() {
+        // DNS and a single bad remote host both sit past the ISP; neither is evidence for
+        // the other, and calling one the cause of the other would hide a real second fault.
+        assert!(!Layer::Dns.explains(Layer::Remote));
+        assert!(!Layer::Remote.explains(Layer::Dns));
+    }
+
+    #[test]
+    fn primary_layer_is_the_worst_localized_verdict() {
+        let s = Signals {
+            gateway: Some(Health::Crit),
+            ..healthy()
+        };
+        assert_eq!(primary_of(&diagnose_signals(&s)), Some(Layer::Gateway));
+    }
+
+    #[test]
+    fn a_healthy_network_blames_nothing() {
+        assert_eq!(primary_of(&diagnose_signals(&healthy())), None);
     }
 
     // --- integration: from_state projection ---

@@ -171,6 +171,71 @@ impl Debouncer {
     }
 }
 
+/// Spots a metric that keeps changing its mind.
+///
+/// The [`Debouncer`] stops one bad reading from raising an alert, but it has nothing to say
+/// about a link that genuinely trips and clears every ten seconds. That produces a stream of
+/// perfectly-correct incidents which together convey one fact — "this is unstable" — and
+/// bury everything else in the feed while doing it.
+///
+/// Once `flaps` committed transitions land inside `window`, the detector says so, and the
+/// caller reports that instead of the individual swings. It settles again when the window
+/// empties, which needs the passage of time, not a transition: a metric that has gone quiet
+/// has no swings left to notice with.
+#[derive(Debug, Clone)]
+pub struct FlapDetector {
+    /// Transition instants inside the window, oldest first.
+    transitions: std::collections::VecDeque<DateTime<Utc>>,
+    flaps: usize,
+    window: Duration,
+    flapping: bool,
+}
+
+impl FlapDetector {
+    /// Report flapping once `flaps` transitions fall within `window`. A `flaps` under 2 is
+    /// treated as *disabled* — "every transition is a flap" would silence the whole feed.
+    pub fn new(flaps: usize, window: Duration) -> Self {
+        Self {
+            transitions: std::collections::VecDeque::new(),
+            flaps,
+            window,
+            flapping: false,
+        }
+    }
+
+    /// Whether the metric is currently considered unstable.
+    pub fn is_flapping(&self) -> bool {
+        self.flapping
+    }
+
+    /// Transitions currently inside the window — what the "is flapping" incident reports.
+    pub fn recent(&self) -> usize {
+        self.transitions.len()
+    }
+
+    /// Record whether a transition happened at `now`, expiring any that have aged out.
+    ///
+    /// Returns `Some(true)` the moment the metric starts flapping and `Some(false)` the
+    /// moment it settles; `None` when the verdict is unchanged. Callers should pass
+    /// `false` on every fold so a quiet metric can settle.
+    pub fn observe(&mut self, now: DateTime<Utc>, transitioned: bool) -> Option<bool> {
+        if transitioned {
+            self.transitions.push_back(now);
+        }
+        // A clock corrected backwards would otherwise hold stale transitions forever.
+        let cutoff = now - self.window;
+        while self.transitions.front().is_some_and(|t| *t < cutoff) {
+            self.transitions.pop_front();
+        }
+        let flapping = self.flaps >= 2 && self.transitions.len() >= self.flaps;
+        if flapping == self.flapping {
+            return None;
+        }
+        self.flapping = flapping;
+        Some(flapping)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -347,5 +412,104 @@ mod tests {
         assert_eq!(d.current(), HOk); // not yet committed
         d.update(t0() + secs(3), Crit);
         assert_eq!(d.current(), Crit);
+    }
+
+    // --- FlapDetector ---
+
+    /// Four swings inside two minutes is "unstable"; the app's default shape.
+    fn detector() -> FlapDetector {
+        FlapDetector::new(4, secs(120))
+    }
+
+    #[test]
+    fn a_metric_that_transitions_once_is_not_flapping() {
+        let mut d = detector();
+        assert_eq!(d.observe(t0(), true), None);
+        assert!(!d.is_flapping());
+    }
+
+    #[test]
+    fn enough_transitions_inside_the_window_is_flapping() {
+        let mut d = detector();
+        for i in 0..3 {
+            assert_eq!(d.observe(t0() + secs(i * 10), true), None, "swing {i}");
+        }
+        assert_eq!(
+            d.observe(t0() + secs(30), true),
+            Some(true),
+            "the fourth swing in 30s is the one that says 'unstable'"
+        );
+        assert!(d.is_flapping());
+    }
+
+    #[test]
+    fn flapping_is_announced_once_not_on_every_further_swing() {
+        let mut d = detector();
+        for i in 0..4 {
+            d.observe(t0() + secs(i * 10), true);
+        }
+        assert_eq!(d.observe(t0() + secs(50), true), None, "already said so");
+        assert_eq!(d.observe(t0() + secs(60), true), None);
+    }
+
+    #[test]
+    fn transitions_spread_beyond_the_window_are_not_flapping() {
+        // Four swings, but one every 60s: that is a link changing state, not thrashing.
+        let mut d = detector();
+        for i in 0..6 {
+            assert_eq!(d.observe(t0() + secs(i * 60), true), None, "swing {i}");
+        }
+        assert!(!d.is_flapping());
+    }
+
+    #[test]
+    fn a_flapping_metric_settles_once_the_window_empties() {
+        let mut d = detector();
+        for i in 0..4 {
+            d.observe(t0() + secs(i * 10), true);
+        }
+        assert!(d.is_flapping());
+        // Time passes with no further swings; the last one ages out at +30s +120s.
+        assert_eq!(
+            d.observe(t0() + secs(100), false),
+            None,
+            "still within the window"
+        );
+        assert_eq!(d.observe(t0() + secs(151), false), Some(false), "settled");
+        assert!(!d.is_flapping());
+    }
+
+    #[test]
+    fn a_settled_metric_can_start_flapping_again() {
+        let mut d = detector();
+        for i in 0..4 {
+            d.observe(t0() + secs(i * 10), true);
+        }
+        assert_eq!(d.observe(t0() + secs(151), false), Some(false));
+        let base = 200;
+        for i in 0..3 {
+            assert_eq!(d.observe(t0() + secs(base + i * 10), true), None);
+        }
+        assert_eq!(d.observe(t0() + secs(base + 30), true), Some(true));
+    }
+
+    #[test]
+    fn a_zero_threshold_detector_never_flaps() {
+        // A count of 0 (or 1) would mean "every single transition is a flap", which would
+        // silence the whole event feed. Treated as "disabled" instead.
+        let mut d = FlapDetector::new(0, secs(120));
+        for i in 0..10 {
+            assert_eq!(d.observe(t0() + secs(i), true), None, "swing {i}");
+        }
+        assert!(!d.is_flapping());
+    }
+
+    #[test]
+    fn flap_count_reports_the_swings_that_triggered_it() {
+        let mut d = detector();
+        for i in 0..4 {
+            d.observe(t0() + secs(i * 10), true);
+        }
+        assert_eq!(d.recent(), 4, "the incident should be able to say how many");
     }
 }
