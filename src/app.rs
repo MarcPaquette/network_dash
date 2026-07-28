@@ -8,11 +8,11 @@
 
 use std::collections::{BTreeMap, VecDeque};
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Timelike, Utc};
 
 use crate::config::Config;
 use crate::health::{Debouncer, Health, Thresholds};
-use crate::history::{LossWindow, Series};
+use crate::history::{LossWindow, RingBuffer, Series};
 use crate::incidents::Incident;
 use crate::metrics::{Hop, MetricId, Sample};
 use crate::ui::theme::Theme;
@@ -117,8 +117,14 @@ pub struct ThroughputState {
     pub rx_bps: Option<Series>,
     pub tx_bps: Option<Series>,
     pub last_mbps: Option<f64>,
+    /// Capacity-probe results over time. Kept apart from `rx_bps`/`tx_bps` because the
+    /// probe runs on a minutes-long cadence and cannot share their per-second axis.
+    pub capacity_mbps: Option<Series>,
     pub idle_latency_ms: Option<f64>,
     pub loaded_latency_ms: Option<f64>,
+    /// Latency added under load, per bufferbloat measurement. History because bloat is
+    /// usually intermittent — the latest reading routinely misses it.
+    pub added_latency_ms: Option<Series>,
     health: Option<Debouncer>,
     bufferbloat_health: Option<Debouncer>,
 }
@@ -139,6 +145,10 @@ pub struct LinkState {
     pub noise_dbm: Option<f64>,
     pub tx_rate: Option<f64>,
     pub ssid: Option<String>,
+    /// Signal and noise floor over time, in dBm. A radio decaying over ten minutes looks
+    /// entirely plausible at every individual reading; only the trend gives it away.
+    pub rssi_history: Option<Series>,
+    pub noise_history: Option<Series>,
     health: Option<Debouncer>,
 }
 
@@ -152,6 +162,23 @@ pub struct RoutingState {
     /// Per-hop detail from the last traceroute (address, best RTT, probe loss).
     pub detail: Vec<Hop>,
     health: Option<Debouncer>,
+}
+
+/// Minutes of history the availability strip retains — about one cell per column on the
+/// target 222-wide terminal, i.e. a little under four hours at a glance.
+pub const AVAILABILITY_MINUTES: usize = 220;
+
+/// Minute counts behind the availability strip's headline.
+///
+/// `unknown` minutes are excluded from `uptime_pct` on purpose: the dashboard cannot
+/// vouch for time it was not running, and counting it either way would be a guess.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct AvailabilityRollup {
+    pub ok: usize,
+    pub degraded: usize,
+    pub down: usize,
+    pub unknown: usize,
+    pub uptime_pct: f64,
 }
 
 /// Live state of the theme-picker overlay (open only while `Some`).
@@ -189,6 +216,9 @@ pub struct AppState {
     /// First incident-log write failure, kept so the header can say the on-disk history is
     /// no longer being recorded. `None` means the log is healthy (or was never opened).
     pub log_error: Option<String>,
+    /// One bucket per wall-clock minute holding the worst health observed in it, oldest
+    /// first. `None` means the minute was never observed (the process was down or asleep).
+    pub availability: RingBuffer<(DateTime<Utc>, Option<Health>)>,
     /// How many newest incidents are scrolled past in the events feed.
     pub events_scroll: usize,
     /// Whether the keybinding help overlay is showing.
@@ -219,6 +249,7 @@ impl AppState {
             events: VecDeque::new(),
             max_events: 200,
             log_error: None,
+            availability: RingBuffer::new(AVAILABILITY_MINUTES),
             events_scroll: 0,
             show_help: false,
             theme_picker: None,
@@ -282,7 +313,72 @@ impl AppState {
         for inc in &incidents {
             self.push_event(inc.clone());
         }
+        // After the fold, so the minute reflects the sample just applied. Ticking here as
+        // well as from the render loop keeps the strip alive on headless paths, where
+        // nothing ever renders.
+        self.tick(now);
         incidents
+    }
+
+    /// Advance the availability strip to `now`.
+    ///
+    /// Called from both the reducer and the render loop: samples alone would leave the
+    /// strip frozen during a total outage (no samples arrive to fold), and renders alone
+    /// would leave it empty under `--once`. Idempotent within a minute, so calling it at
+    /// the render rate costs nothing but a worst-of merge.
+    pub fn tick(&mut self, now: DateTime<Utc>) {
+        let Some(bucket) = now.with_second(0).and_then(|t| t.with_nanosecond(0)) else {
+            return;
+        };
+        let health = self.overall_health();
+        match self.availability.latest().copied() {
+            // Same minute (or a clock that stepped backwards): merge, never regress.
+            Some((last, _)) if last >= bucket => {
+                if let Some((_, h)) = self.availability.latest_mut() {
+                    let merged = h.map_or(health, |prev| prev.worst(health));
+                    *h = Some(merged);
+                }
+            }
+            Some((last, _)) => {
+                // Minutes nobody observed are unknown, not healthy — back-filling `Ok`
+                // would invent uptime across a laptop sleep. Bounded by the strip length so
+                // waking after a week is one full strip, not ten thousand pushes.
+                let missing = (bucket - last)
+                    .num_minutes()
+                    .saturating_sub(1)
+                    .clamp(0, AVAILABILITY_MINUTES as i64);
+                for k in 0..missing {
+                    let ts = bucket - chrono::Duration::minutes(missing - k);
+                    self.availability.push((ts, None));
+                }
+                self.availability.push((bucket, Some(health)));
+            }
+            None => self.availability.push((bucket, Some(health))),
+        }
+    }
+
+    /// Summarize the availability strip for the panel headline.
+    pub fn availability_rollup(&self) -> AvailabilityRollup {
+        let mut r = AvailabilityRollup {
+            ok: 0,
+            degraded: 0,
+            down: 0,
+            unknown: 0,
+            uptime_pct: 100.0,
+        };
+        for (_, h) in self.availability.iter() {
+            match h {
+                Some(Health::Ok) => r.ok += 1,
+                Some(Health::Warn) => r.degraded += 1,
+                Some(Health::Crit) => r.down += 1,
+                None => r.unknown += 1,
+            }
+        }
+        let known = r.ok + r.degraded + r.down;
+        if known > 0 {
+            r.uptime_pct = 100.0 * r.ok as f64 / known as f64;
+        }
+        r
     }
 
     fn apply_latency(
@@ -510,6 +606,10 @@ impl AppState {
         self.throughput.idle_latency_ms = Some(idle_ms);
         self.throughput.loaded_latency_ms = Some(loaded_ms);
         let delta = (loaded_ms - idle_ms).max(0.0);
+        self.throughput
+            .added_latency_ms
+            .get_or_insert_with(|| Series::new(cfg.thresholds.history_len))
+            .push(delta);
         let thr = cfg.thresholds.bufferbloat;
         let raw = thr.evaluate(delta);
         let health = self
@@ -580,6 +680,10 @@ impl AppState {
     fn apply_throughput_probe(&mut self, now: DateTime<Utc>, mbps: f64) -> Vec<Incident> {
         let cfg = self.config.clone();
         self.throughput.last_mbps = Some(mbps);
+        self.throughput
+            .capacity_mbps
+            .get_or_insert_with(|| Series::new(cfg.thresholds.history_len))
+            .push(mbps);
         let thr = cfg.thresholds.throughput;
         let raw = thr.evaluate(mbps);
         let health = self
@@ -639,9 +743,24 @@ impl AppState {
             self.link.tx_rate = tx_rate;
         }
         let Some(rssi) = rssi_dbm else {
+            // No reading at all (radio off, or the shell-out failed). Recording that as a
+            // data point would draw a cliff in the trend line that never happened.
             return Vec::new();
         };
         self.link.rssi_dbm = Some(rssi);
+        let cap = cfg.thresholds.history_len;
+        self.link
+            .rssi_history
+            .get_or_insert_with(|| Series::new(cap))
+            .push(rssi);
+        // Pushed in the same breath as the signal so the two series stay index-aligned —
+        // SNR is read off the chart as the vertical gap between them.
+        if let Some(n) = noise_dbm {
+            self.link
+                .noise_history
+                .get_or_insert_with(|| Series::new(cap))
+                .push(n);
+        }
         let raw = thr.evaluate(rssi);
         let health = self
             .link
@@ -909,6 +1028,192 @@ mod tests {
             target: target.into(),
             rtt_ms: None,
         }
+    }
+
+    /// The health recorded in each availability bucket, oldest → newest.
+    fn strip(s: &AppState) -> Vec<Option<Health>> {
+        s.availability.iter().map(|(_, h)| *h).collect()
+    }
+
+    #[test]
+    fn tick_opens_one_availability_bucket_per_minute() {
+        let mut s = AppState::new(test_config());
+        let t = now();
+        s.tick(t);
+        s.tick(t + chrono::Duration::seconds(20));
+        s.tick(t + chrono::Duration::seconds(59));
+        assert_eq!(strip(&s).len(), 1, "one minute is one bucket");
+        s.tick(t + chrono::Duration::seconds(60));
+        assert_eq!(strip(&s).len(), 2);
+    }
+
+    #[test]
+    fn a_minute_is_recorded_at_its_worst_not_its_last() {
+        let mut s = AppState::new(test_config());
+        let t = now();
+        s.tick(t); // healthy
+        // One total outage inside the minute, then recovery — the minute was not "ok".
+        for _ in 0..4 {
+            s.apply_sample(t, timeout("1.1.1.1"));
+        }
+        s.tick(t + chrono::Duration::seconds(10));
+        for _ in 0..8 {
+            s.apply_sample(t, latency("1.1.1.1", 10.0));
+        }
+        s.tick(t + chrono::Duration::seconds(50));
+        assert_eq!(
+            strip(&s),
+            vec![Some(Health::Crit)],
+            "an outage that healed inside the minute still happened"
+        );
+    }
+
+    #[test]
+    fn skipped_minutes_are_recorded_as_unknown_not_healthy() {
+        let mut s = AppState::new(test_config());
+        let t = now();
+        s.tick(t);
+        // The laptop slept for four minutes: we have no idea what the link was doing, and
+        // back-filling "ok" would invent uptime the dashboard never observed.
+        s.tick(t + chrono::Duration::minutes(5));
+        assert_eq!(
+            strip(&s),
+            vec![Some(Health::Ok), None, None, None, None, Some(Health::Ok)]
+        );
+    }
+
+    #[test]
+    fn a_gap_longer_than_the_strip_does_not_replay_every_missing_minute() {
+        let mut s = AppState::new(test_config());
+        let t = now();
+        s.tick(t);
+        s.tick(t + chrono::Duration::days(3));
+        assert_eq!(
+            s.availability.len(),
+            s.availability.capacity(),
+            "the strip is bounded; a long sleep should fill it, not iterate for days"
+        );
+    }
+
+    #[test]
+    fn applying_a_sample_advances_the_availability_strip() {
+        // Samples arrive far more often than renders under `--once`, and the strip must
+        // still be populated for the panel to have anything to draw.
+        let mut s = AppState::new(test_config());
+        s.apply_sample(now(), latency("1.1.1.1", 12.0));
+        assert_eq!(strip(&s).len(), 1);
+    }
+
+    #[test]
+    fn availability_rollup_counts_each_grade_and_ignores_unknown_minutes() {
+        let mut s = AppState::new(test_config());
+        let t = now();
+        s.tick(t); // minute 0: healthy
+        for _ in 0..4 {
+            // minute 1: total outage (each sample ticks the strip itself)
+            s.apply_sample(t + chrono::Duration::minutes(1), timeout("1.1.1.1"));
+        }
+        s.tick(t + chrono::Duration::minutes(4)); // still down, after a 2-minute gap
+        let r = s.availability_rollup();
+        assert_eq!((r.ok, r.degraded, r.down, r.unknown), (1, 0, 2, 2));
+        // Unknown minutes are not counted against uptime — we did not observe them.
+        assert!((r.uptime_pct - 100.0 / 3.0).abs() < 0.01, "{r:?}");
+    }
+
+    #[test]
+    fn availability_rollup_of_an_empty_strip_is_not_zero_percent() {
+        // A dashboard that just started has not had an outage; reporting 0% would be a lie.
+        let s = AppState::new(test_config());
+        assert_eq!(s.availability_rollup().uptime_pct, 100.0);
+    }
+
+    #[test]
+    fn link_samples_accumulate_signal_history() {
+        let mut s = AppState::new(test_config());
+        for (rssi, noise) in [(-45.0, -92.0), (-52.0, -91.0), (-61.0, -90.0)] {
+            s.apply_sample(
+                now(),
+                Sample::Link {
+                    rssi_dbm: Some(rssi),
+                    noise_dbm: Some(noise),
+                    tx_rate: Some(400.0),
+                    ssid: Some("MyNet".into()),
+                },
+            );
+        }
+        // A radio decaying from -45 to -61 dBm is invisible in the current reading alone.
+        let rssi = s.link.rssi_history.as_ref().expect("rssi history");
+        assert_eq!(rssi.values(), vec![-45.0, -52.0, -61.0]);
+        let noise = s.link.noise_history.as_ref().expect("noise history");
+        assert_eq!(noise.values(), vec![-92.0, -91.0, -90.0]);
+    }
+
+    #[test]
+    fn a_link_sample_without_a_reading_does_not_pad_the_history() {
+        // The Wi-Fi probe returns `None` when the radio is off or the shell-out failed;
+        // recording that as a data point would draw a cliff that never happened.
+        let mut s = AppState::new(test_config());
+        s.apply_sample(
+            now(),
+            Sample::Link {
+                rssi_dbm: None,
+                noise_dbm: None,
+                tx_rate: None,
+                ssid: None,
+            },
+        );
+        assert!(s.link.rssi_history.is_none());
+    }
+
+    #[test]
+    fn capacity_probes_accumulate_history() {
+        let mut s = AppState::new(test_config());
+        for mbps in [420.0, 380.0, 55.0] {
+            s.apply_sample(now(), Sample::ThroughputProbe { mbps });
+        }
+        assert_eq!(
+            s.throughput
+                .capacity_mbps
+                .as_ref()
+                .expect("capacity history")
+                .values(),
+            vec![420.0, 380.0, 55.0]
+        );
+    }
+
+    #[test]
+    fn bufferbloat_samples_record_the_added_latency_not_the_raw_pair() {
+        let mut s = AppState::new(test_config());
+        s.apply_sample(
+            now(),
+            Sample::Bufferbloat {
+                idle_ms: 18.0,
+                loaded_ms: 143.0,
+            },
+        );
+        let h = s
+            .throughput
+            .added_latency_ms
+            .as_ref()
+            .expect("bufferbloat history");
+        assert_eq!(h.values(), vec![125.0], "the delta is the metric");
+    }
+
+    #[test]
+    fn bufferbloat_never_records_a_negative_delta() {
+        // Loaded latency below idle is measurement noise, not a negative stall.
+        let mut s = AppState::new(test_config());
+        s.apply_sample(
+            now(),
+            Sample::Bufferbloat {
+                idle_ms: 30.0,
+                loaded_ms: 22.0,
+            },
+        );
+        assert_eq!(
+            s.throughput.added_latency_ms.as_ref().unwrap().values(),
+            vec![0.0]
+        );
     }
 
     #[test]

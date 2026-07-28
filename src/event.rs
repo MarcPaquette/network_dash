@@ -180,9 +180,12 @@ pub async fn run_once(config: Config) -> color_eyre::Result<()> {
     samples.extend(reach.tick().await);
     samples.extend(crate::metrics::link::WifiProbe.tick().await);
     samples.extend(
-        crate::metrics::routing::RoutingProbe::new(config.targets.routing_target.clone(), 15)
-            .tick()
-            .await,
+        crate::metrics::routing::RoutingProbe::new(
+            config.targets.routing_target.clone(),
+            config.targets.max_hops,
+        )
+        .tick()
+        .await,
     );
 
     let now = chrono::Utc::now();
@@ -333,7 +336,10 @@ async fn run_inner(terminal: &mut crate::tui::Tui, config: Config) -> color_eyre
 
     // Routing / path (lightweight traceroute).
     handles.push(spawn_probe(
-        crate::metrics::routing::RoutingProbe::new(config.targets.routing_target.clone(), 15),
+        crate::metrics::routing::RoutingProbe::new(
+            config.targets.routing_target.clone(),
+            config.targets.max_hops,
+        ),
         Duration::from_millis(config.cadence.routing_ms),
         tx.clone(),
         &wake,
@@ -345,6 +351,10 @@ async fn run_inner(terminal: &mut crate::tui::Tui, config: Config) -> color_eyre
     loop {
         tokio::select! {
             _ = render_tick.tick() => {
+                // Advance the availability strip from the clock, not from samples: during a
+                // total outage no samples arrive at all, and a strip that stops moving is
+                // exactly the wrong thing to show when everything is down.
+                state.tick(Utc::now());
                 terminal.draw(|f| ui::render(f, &state))?;
             }
             maybe_event = reader.next() => {

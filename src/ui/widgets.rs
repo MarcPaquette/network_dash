@@ -45,6 +45,19 @@ impl LineSeries {
             points,
         }
     }
+
+    /// A flat horizontal line at `y` spanning the chart — a threshold band. Deliberately
+    /// unnamed: it is a scale marker, not a measurement, and naming it would put it in the
+    /// panel's colour key alongside the real targets.
+    pub fn reference(color: Color, y: f64, x_max: f64) -> Self {
+        Self {
+            name: String::new(),
+            color,
+            // Matches `line_chart`'s own `x_max.max(1.0)` floor, so a band on a
+            // one-sample chart still crosses the full width.
+            points: vec![(0.0, y), (x_max.max(1.0), y)],
+        }
+    }
 }
 
 /// A braille line chart over `series`, x spanning `0..=x_max`, y clamped to `y_bounds`.
@@ -59,15 +72,22 @@ pub fn line_chart<'a>(
         .iter()
         .filter(|s| !s.points.is_empty())
         .map(|s| {
-            Dataset::default()
-                .name(s.name.clone())
+            let d = Dataset::default()
                 .marker(Marker::Braille)
                 .graph_type(GraphType::Line)
                 .style(Style::default().fg(s.color))
-                .data(&s.points)
+                .data(&s.points);
+            // Naming a dataset is what enrols it in ratatui's legend accounting, so
+            // reference bands stay anonymous.
+            if s.name.is_empty() {
+                d
+            } else {
+                d.name(s.name.clone())
+            }
         })
         .collect();
     Chart::new(datasets)
+        .legend_position(None)
         .x_axis(Axis::default().bounds([0.0, x_max.max(1.0)]))
         .y_axis(
             Axis::default()
@@ -111,5 +131,52 @@ mod tests {
         let c = border_corner_color(Health::Ok);
         assert_ne!(c, Color::Red);
         assert_ne!(c, Color::Yellow);
+    }
+
+    #[test]
+    fn reference_line_is_flat_and_spans_the_x_range() {
+        let r = LineSeries::reference(Color::Red, 150.0, 47.0);
+        assert_eq!(r.points, vec![(0.0, 150.0), (47.0, 150.0)]);
+        assert!(
+            r.name.is_empty(),
+            "a threshold band is chart furniture, not a data series — it must not be named"
+        );
+    }
+
+    #[test]
+    fn reference_line_still_spans_a_single_point_chart() {
+        // With one sample, `line_chart` widens x to [0,1]; the band has to match or it
+        // collapses to a dot in the corner.
+        assert_eq!(LineSeries::reference(Color::Red, 5.0, 0.0).points[1].0, 1.0);
+    }
+
+    #[test]
+    fn chart_draws_no_legend() {
+        // Panels carry their own colour-keyed summary rows; ratatui's legend box would
+        // sit on top of the plot and steal columns from the trace.
+        let series = vec![LineSeries::from_values(
+            "cloudflare",
+            Color::Cyan,
+            &[1.0, 5.0, 3.0],
+        )];
+        let mut terminal = Terminal::new(TestBackend::new(60, 12)).unwrap();
+        terminal
+            .draw(|f| {
+                let c = line_chart(&series, 2.0, [0.0, 5.0], vec!["0".into(), "5".into()]);
+                f.render_widget(c, f.area());
+            })
+            .unwrap();
+        let buf = terminal.backend().buffer();
+        let area = *buf.area();
+        let mut text = String::new();
+        for y in 0..area.height {
+            for x in 0..area.width {
+                text.push_str(buf[(x, y)].symbol());
+            }
+        }
+        assert!(
+            !text.contains("cloudflare"),
+            "series names should not render a legend box: {text}"
+        );
     }
 }

@@ -46,6 +46,9 @@ pub struct Targets {
     pub internet: Vec<String>,
     /// Stable target for the routing / traceroute probe.
     pub routing_target: String,
+    /// Maximum TTL the path probe walks before giving up. Raising it lengthens every
+    /// traceroute; the default reaches any reasonable destination.
+    pub max_hops: usize,
 }
 
 impl Default for Targets {
@@ -55,6 +58,7 @@ impl Default for Targets {
             gateway: None,
             internet: vec!["1.1.1.1".to_string(), "8.8.8.8".to_string()],
             routing_target: "1.1.1.1".to_string(),
+            max_hops: 15,
         }
     }
 }
@@ -296,6 +300,7 @@ mod tests {
             "need default internet targets"
         );
         assert!(!c.targets.routing_target.is_empty());
+        assert!(c.targets.max_hops > 0, "a 0-hop traceroute probes nothing");
         assert_eq!(c.resolvers.len(), 3, "system + cloudflare + google");
         assert!(c.cadence.ping_ms > 0);
         assert!(c.cadence.render_ms > 0);
