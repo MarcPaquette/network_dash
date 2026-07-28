@@ -11,12 +11,12 @@ use std::time::Duration;
 use chrono::Utc;
 use crossterm::event::{Event, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use futures::StreamExt;
-use tokio::sync::mpsc;
+use tokio::sync::{broadcast, mpsc};
 use tokio::task::JoinHandle;
 
 use crate::app::{Action, AppState};
 use crate::config::Config;
-use crate::incidents::IncidentLog;
+use crate::incidents::RotatingLog;
 use crate::metrics::{Probe, Sample};
 use crate::ui;
 
@@ -58,12 +58,23 @@ pub fn map_picker_key(key: KeyEvent) -> Option<Action> {
     }
 }
 
-/// Spawn a task that ticks `probe` every `interval` and forwards its samples to `tx`.
-/// The task ends when the receiver is dropped.
-pub fn spawn_probe<P>(mut probe: P, interval: Duration, tx: mpsc::Sender<Sample>) -> JoinHandle<()>
+/// Spawn a task that ticks `probe` every `interval` — or as soon as `wake` fires — and
+/// forwards its samples to `tx`. The task ends when the receiver is dropped.
+///
+/// `wake` is what makes [`Action::ForceRefresh`] real: without it, `r` could not do
+/// anything for a probe on a 60-second cadence, which is exactly when it's pressed.
+pub fn spawn_probe<P>(
+    mut probe: P,
+    interval: Duration,
+    tx: mpsc::Sender<Sample>,
+    wake: &broadcast::Sender<()>,
+) -> JoinHandle<()>
 where
     P: Probe + Send + 'static,
 {
+    // Subscribe before spawning, so a refresh sent right after this call can't slip
+    // through the gap before the task first runs.
+    let mut wake = wake.subscribe();
     tokio::spawn(async move {
         let mut ticker = tokio::time::interval(interval);
         // If a tick overruns (a slow probe), re-align to the cadence grid rather than
@@ -71,7 +82,20 @@ where
         // panel go quiet and then jump instead of updating on regular intervals.
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
-            ticker.tick().await;
+            tokio::select! {
+                _ = ticker.tick() => {}
+                recv = wake.recv() => {
+                    // `Lagged` just means several refreshes piled up while a slow probe was
+                    // mid-tick; one catch-up run answers all of them. `Closed` means the app
+                    // is shutting down.
+                    if matches!(recv, Err(broadcast::error::RecvError::Closed)) {
+                        return;
+                    }
+                    // Restart the cadence from now, so a manual refresh isn't immediately
+                    // followed by the scheduled tick it just pre-empted.
+                    ticker.reset();
+                }
+            }
             for sample in probe.tick().await {
                 if tx.send(sample).await.is_err() {
                     return;
@@ -218,9 +242,11 @@ pub async fn run(config: Config) -> color_eyre::Result<()> {
 async fn run_inner(terminal: &mut crate::tui::Tui, config: Config) -> color_eyre::Result<()> {
     let mut state = AppState::new(config.clone());
     let (tx, mut rx) = mpsc::channel::<Sample>(256);
+    // Broadcast wake channel: `r` (Action::ForceRefresh) pokes every probe at once.
+    let (wake, _) = broadcast::channel::<()>(8);
 
     // Best-effort incident log; the dashboard still runs if it can't be opened.
-    let mut log = IncidentLog::default_path().and_then(|path| IncidentLog::open_append(&path).ok());
+    let mut log = RotatingLog::open_default();
 
     // Detect the default route: register the gateway (as a stricter-threshold ping target)
     // and record the interface / MTU / VPN facts.
@@ -243,9 +269,14 @@ async fn run_inner(terminal: &mut crate::tui::Tui, config: Config) -> color_eyre
     let mut handles = Vec::new();
     match crate::metrics::ping::PingProbe::new(&targets, timeout) {
         Ok(probe) if probe.target_count() > 0 => {
-            handles.push(spawn_probe(probe, interval, tx.clone()));
+            handles.push(spawn_probe(probe, interval, tx.clone(), &wake));
         }
-        _ => handles.push(spawn_probe(DemoProbe::new(targets), interval, tx.clone())),
+        _ => handles.push(spawn_probe(
+            DemoProbe::new(targets),
+            interval,
+            tx.clone(),
+            &wake,
+        )),
     }
 
     // DNS resolver comparison. Bound each lookup well under the cadence so a slow or
@@ -254,7 +285,7 @@ async fn run_inner(terminal: &mut crate::tui::Tui, config: Config) -> color_eyre
     let dns_timeout = Duration::from_secs(2).min(dns_interval);
     let dns = crate::metrics::dns::DnsProbe::new(&config.resolvers, dns_timeout);
     if dns.resolver_count() > 0 {
-        handles.push(spawn_probe(dns, dns_interval, tx.clone()));
+        handles.push(spawn_probe(dns, dns_interval, tx.clone(), &wake));
     }
 
     // HTTP(S) reachability + captive/IPv6.
@@ -264,6 +295,7 @@ async fn run_inner(terminal: &mut crate::tui::Tui, config: Config) -> color_eyre
         ),
         Duration::from_millis(config.cadence.reachability_ms),
         tx.clone(),
+        &wake,
     ));
 
     // Passive throughput counters.
@@ -272,6 +304,7 @@ async fn run_inner(terminal: &mut crate::tui::Tui, config: Config) -> color_eyre
         crate::metrics::throughput::ThroughputProbe::new(tput_interval),
         tput_interval,
         tx.clone(),
+        &wake,
     ));
 
     // Active capacity probe (a bounded download on a slow cadence).
@@ -279,6 +312,7 @@ async fn run_inner(terminal: &mut crate::tui::Tui, config: Config) -> color_eyre
         crate::metrics::throughput::CapacityProbe::new(config.throughput.probe_url.clone()),
         Duration::from_millis(config.cadence.throughput_probe_ms),
         tx.clone(),
+        &wake,
     ));
 
     // Public/WAN IP (for ISP-change detection), on a slow cadence.
@@ -286,6 +320,7 @@ async fn run_inner(terminal: &mut crate::tui::Tui, config: Config) -> color_eyre
         crate::metrics::pubip::PublicIpProbe::cloudflare(),
         Duration::from_millis(config.cadence.public_ip_ms),
         tx.clone(),
+        &wake,
     ));
 
     // Wireless link (macOS system_profiler).
@@ -293,6 +328,7 @@ async fn run_inner(terminal: &mut crate::tui::Tui, config: Config) -> color_eyre
         crate::metrics::link::WifiProbe,
         Duration::from_millis(config.cadence.link_ms),
         tx.clone(),
+        &wake,
     ));
 
     // Routing / path (lightweight traceroute).
@@ -300,6 +336,7 @@ async fn run_inner(terminal: &mut crate::tui::Tui, config: Config) -> color_eyre
         crate::metrics::routing::RoutingProbe::new(config.targets.routing_target.clone(), 15),
         Duration::from_millis(config.cadence.routing_ms),
         tx.clone(),
+        &wake,
     ));
 
     let mut reader = EventStream::new();
@@ -322,6 +359,10 @@ async fn run_inner(terminal: &mut crate::tui::Tui, config: Config) -> color_eyre
                         map_key(key)
                     };
                     if let Some(action) = action {
+                        if action == Action::ForceRefresh {
+                            // Ignore the error: no subscribers just means no probes running.
+                            let _ = wake.send(());
+                        }
                         state.apply_action(action);
                     }
                 }
@@ -329,8 +370,12 @@ async fn run_inner(terminal: &mut crate::tui::Tui, config: Config) -> color_eyre
             Some(sample) = rx.recv() => {
                 if !state.paused {
                     for inc in state.apply_sample(Utc::now(), sample) {
-                        if let Some(log) = log.as_mut() {
-                            let _ = log.append(&inc);
+                        if let Some(log) = log.as_mut()
+                            && let Err(e) = log.append(&inc)
+                        {
+                            // Reported once, in-memory only: the sink we would log it to is
+                            // the thing that just failed.
+                            state.note_log_error(Utc::now(), &e.to_string());
                         }
                     }
                 }
@@ -457,7 +502,8 @@ mod tests {
                 rtt_ms: Some(2.0),
             }],
         ]);
-        let handle = spawn_probe(probe, Duration::from_millis(1), tx);
+        let (wake, _) = broadcast::channel(1);
+        let handle = spawn_probe(probe, Duration::from_millis(1), tx, &wake);
         let a = rx.recv().await.unwrap();
         let b = rx.recv().await.unwrap();
         handle.abort();
@@ -508,6 +554,7 @@ mod tests {
         // re-aligns to the cadence instead.
         let period = Duration::from_millis(100);
         let (tx, mut rx) = mpsc::channel(64);
+        let (wake, _) = broadcast::channel(1);
         let start = tokio::time::Instant::now();
         let handle = spawn_probe(
             SlowFirstProbe {
@@ -516,6 +563,7 @@ mod tests {
             },
             period,
             tx,
+            &wake,
         );
 
         let mut stamps = Vec::new();
@@ -534,6 +582,78 @@ mod tests {
         );
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn wake_ticks_a_probe_before_its_next_interval() {
+        // The routing probe runs once a minute. Pressing `r` has to mean something sooner
+        // than that, or the key is decoration.
+        let period = Duration::from_secs(60);
+        let (tx, mut rx) = mpsc::channel(16);
+        let (wake, _) = broadcast::channel(4);
+        let probe = crate::metrics::FakeProbe::new(vec![
+            vec![Sample::Latency {
+                target: "gw".into(),
+                rtt_ms: Some(1.0),
+            }],
+            vec![Sample::Latency {
+                target: "gw".into(),
+                rtt_ms: Some(2.0),
+            }],
+        ]);
+        let handle = spawn_probe(probe, period, tx, &wake);
+
+        // `tokio::time::interval` fires immediately, so this is the startup tick.
+        rx.recv().await.unwrap();
+        wake.send(()).unwrap();
+        let forced = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+            .await
+            .expect("a forced refresh must not wait out the 60s cadence")
+            .unwrap();
+        handle.abort();
+        assert_eq!(
+            forced,
+            Sample::Latency {
+                target: "gw".into(),
+                rtt_ms: Some(2.0)
+            }
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn wake_resets_the_cadence_instead_of_double_ticking() {
+        // A manual refresh should restart the clock, not leave a scheduled tick pending
+        // right behind it — otherwise `r` costs two probe runs back to back.
+        let period = Duration::from_secs(10);
+        let (tx, mut rx) = mpsc::channel(16);
+        let (wake, _) = broadcast::channel(4);
+        let handle = spawn_probe(
+            crate::metrics::FakeProbe::new(std::iter::repeat_n(
+                vec![Sample::Latency {
+                    target: "gw".into(),
+                    rtt_ms: Some(1.0),
+                }],
+                8,
+            )),
+            period,
+            tx,
+            &wake,
+        );
+
+        rx.recv().await.unwrap(); // startup tick at t=0
+        tokio::time::sleep(period / 2).await; // t=5s
+        wake.send(()).unwrap();
+        rx.recv().await.unwrap(); // the forced tick
+
+        // The cadence restarted at t=5s, so the next scheduled tick is t=15s — nothing
+        // should arrive in the 9s that follow the refresh.
+        assert!(
+            tokio::time::timeout(period - Duration::from_secs(1), rx.recv())
+                .await
+                .is_err(),
+            "a scheduled tick fired immediately after the forced one"
+        );
+        handle.abort();
+    }
+
     #[tokio::test]
     async fn scheduler_stops_when_receiver_dropped() {
         let (tx, rx) = mpsc::channel(1);
@@ -541,7 +661,8 @@ mod tests {
             target: "gw".into(),
             rtt_ms: Some(1.0),
         }]]);
-        let handle = spawn_probe(probe, Duration::from_millis(1), tx);
+        let (wake, _) = broadcast::channel(1);
+        let handle = spawn_probe(probe, Duration::from_millis(1), tx, &wake);
         drop(rx);
         // The task should finish on its own once sends start failing.
         let _ = tokio::time::timeout(Duration::from_millis(200), handle).await;

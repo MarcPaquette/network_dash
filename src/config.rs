@@ -139,6 +139,8 @@ pub struct ThresholdConfig {
     pub snr: Thresholds,
     /// Added latency under load (bufferbloat) in ms (higher is worse).
     pub bufferbloat: Thresholds,
+    /// Measured link capacity in Mbps (lower is worse).
+    pub throughput: Thresholds,
     /// Consecutive samples required to commit a health change (debounce).
     pub debounce_samples: usize,
     /// Number of ping outcomes retained for the loss window.
@@ -158,6 +160,7 @@ impl Default for ThresholdConfig {
             rssi: Thresholds::lower_is_worse(-70.0, -80.0),
             snr: Thresholds::lower_is_worse(20.0, 10.0),
             bufferbloat: Thresholds::higher_is_worse(100.0, 300.0),
+            throughput: Thresholds::lower_is_worse(100.0, 25.0),
             debounce_samples: 3,
             loss_window: 60,
             history_len: 120,
@@ -169,18 +172,22 @@ impl Default for ThresholdConfig {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ThroughputConfig {
+    /// Endpoint for the active capacity probe. The transfer size is part of the URL, so
+    /// there is no separate byte-count knob to keep in sync with it.
     pub probe_url: String,
-    pub probe_bytes: u64,
-    /// Warn if a capacity probe measures below this many Mbps.
-    pub floor_mbps: f64,
+    /// **Deprecated** — superseded by `thresholds.throughput`, which can also express a
+    /// critical bound. Still accepted so existing configs keep working: on load it seeds
+    /// `thresholds.throughput` (see [`Config::migrate_deprecated`]) and is then dropped,
+    /// so it never round-trips back out.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub floor_mbps: Option<f64>,
 }
 
 impl Default for ThroughputConfig {
     fn default() -> Self {
         Self {
             probe_url: "https://speed.cloudflare.com/__down?bytes=3000000".to_string(),
-            probe_bytes: 3_000_000,
-            floor_mbps: 100.0,
+            floor_mbps: None,
         }
     }
 }
@@ -190,7 +197,6 @@ impl Default for ThroughputConfig {
 #[serde(default)]
 pub struct UiConfig {
     pub color: bool,
-    pub sparkline_points: usize,
     /// Color theme name; must be one of the built-in catalog (see `Theme::NAMES` in
     /// `ui::theme` — `default`, `neon_sunset`, `dracula`, `nord`, …). Unknown names fall
     /// back to `default`. Can also be chosen live at runtime via the `t` theme picker.
@@ -201,16 +207,35 @@ impl Default for UiConfig {
     fn default() -> Self {
         Self {
             color: true,
-            sparkline_points: 120,
             theme: "neon_sunset".to_string(),
         }
     }
 }
 
 impl Config {
-    /// Parse from a TOML string. Omitted fields fall back to their defaults.
+    /// Parse from a TOML string. Omitted fields fall back to their defaults, and
+    /// deprecated keys are folded into their replacements.
     pub fn from_toml_str(s: &str) -> Result<Config, toml::de::Error> {
-        toml::from_str(s)
+        let mut c: Config = toml::from_str(s)?;
+        c.migrate_deprecated();
+        Ok(c)
+    }
+
+    /// Fold deprecated keys into the fields that replaced them, then clear them so they
+    /// do not round-trip back out.
+    ///
+    /// `throughput.floor_mbps` only ever expressed a *warn* bound, so it seeds `warn` and
+    /// drags `crit` underneath it — leaving the stock 25 Mbps crit in place would classify
+    /// every merely-slow reading under a low floor as critical. An explicitly configured
+    /// `thresholds.throughput` always wins.
+    fn migrate_deprecated(&mut self) {
+        let stock = ThresholdConfig::default().throughput;
+        if let Some(floor) = self.throughput.floor_mbps.take()
+            && self.thresholds.throughput == stock
+        {
+            self.thresholds.throughput =
+                Thresholds::lower_is_worse(floor, stock.crit.min(floor / 4.0));
+        }
     }
 
     /// Serialize to a TOML string.
@@ -296,6 +321,51 @@ mod tests {
         assert_eq!(c.ui.theme, "moss_goblin");
         // Sibling ui fields keep their defaults.
         assert_eq!(c.ui.color, Config::default().ui.color);
+    }
+
+    #[test]
+    fn throughput_thresholds_default_to_lower_is_worse() {
+        let t = Config::default().thresholds.throughput;
+        assert_eq!(t.direction, Direction::LowerIsWorse);
+        assert!(
+            t.crit < t.warn,
+            "crit must be the deeper degradation: {t:?}"
+        );
+    }
+
+    #[test]
+    fn deprecated_floor_mbps_seeds_the_throughput_warn_threshold() {
+        let c = Config::from_toml_str("[throughput]\nfloor_mbps = 20.0\n").unwrap();
+        assert_eq!(c.thresholds.throughput.warn, 20.0);
+        // ...and crit must stay strictly below it, or `evaluate` would classify every
+        // merely-warning value as critical.
+        assert!(
+            c.thresholds.throughput.crit < 20.0,
+            "crit should scale under the migrated floor: {:?}",
+            c.thresholds.throughput
+        );
+    }
+
+    #[test]
+    fn explicit_throughput_thresholds_beat_the_deprecated_floor() {
+        let c = Config::from_toml_str(
+            "[throughput]\nfloor_mbps = 20.0\n\n\
+             [thresholds.throughput]\nwarn = 500.0\ncrit = 100.0\ndirection = \"lower_is_worse\"\n",
+        )
+        .unwrap();
+        assert_eq!(c.thresholds.throughput.warn, 500.0);
+        assert_eq!(c.thresholds.throughput.crit, 100.0);
+    }
+
+    #[test]
+    fn removed_keys_do_not_break_an_existing_config() {
+        // `probe_bytes` and `sparkline_points` were never read and have been dropped from
+        // the schema. Someone's config file on disk still has them, and must still load.
+        let c = Config::from_toml_str(
+            "[throughput]\nprobe_bytes = 3000000\n\n[ui]\nsparkline_points = 120\ntheme = \"nord\"\n",
+        )
+        .expect("retired keys must be ignored, not rejected");
+        assert_eq!(c.ui.theme, "nord");
     }
 
     #[test]

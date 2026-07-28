@@ -204,6 +204,16 @@ pub fn header(frame: &mut Frame, area: Rect, state: &AppState) {
     if let Some(ip) = &state.public_ip {
         spans.push(Span::raw(format!("   wan {ip}")));
     }
+    // A log that stopped recording is invisible by nature — badge it, or the operator only
+    // finds out when they go looking for history that was never written.
+    if state.log_error.is_some() {
+        spans.push(Span::styled(
+            "   [LOG ERR]",
+            Style::default()
+                .fg(state.theme.health_color(Health::Warn))
+                .bold(),
+        ));
+    }
     spans.push(Span::raw(if state.paused { "   [PAUSED]" } else { "" }));
     let block = Block::default()
         .borders(Borders::ALL)
@@ -1025,6 +1035,27 @@ mod tests {
             buffer_text(&term).contains("thr"),
             "events should surface the crossed threshold"
         );
+    }
+
+    #[test]
+    fn header_badges_an_unwritable_incident_log() {
+        let mut state = test_state();
+        state.log_error = Some("no space left on device".into());
+        let mut term = Terminal::new(TestBackend::new(120, 3)).unwrap();
+        term.draw(|f| header(f, f.area(), &state)).unwrap();
+        let text = buffer_text(&term);
+        assert!(
+            text.contains("LOG"),
+            "a silently-unwritable log is worse than a noisy one: {text}"
+        );
+    }
+
+    #[test]
+    fn healthy_header_has_no_log_badge() {
+        let state = test_state();
+        let mut term = Terminal::new(TestBackend::new(120, 3)).unwrap();
+        term.draw(|f| header(f, f.area(), &state)).unwrap();
+        assert!(!buffer_text(&term).contains("LOG"));
     }
 
     #[test]
