@@ -444,7 +444,14 @@ impl AppState {
                 Some(if gateway { Layer::Gateway } else { Layer::Isp })
             }
             MetricId::Link => Some(Layer::Wifi),
-            MetricId::Reachability | MetricId::Routing | MetricId::Throughput => Some(Layer::Isp),
+            MetricId::Reachability
+            | MetricId::Routing
+            | MetricId::Throughput
+            | MetricId::Bufferbloat
+            // A portal and a WAN address both localize to the ISP, which is also where
+            // `diagnose` puts them — so neither can be dimmed by the verdict it fed.
+            | MetricId::CaptivePortal
+            | MetricId::PublicIp => Some(Layer::Isp),
             MetricId::Dns => Some(Layer::Dns),
             // The dashboard complaining about its own log has no place on the network.
             MetricId::Log => None,
@@ -724,7 +731,7 @@ impl AppState {
         let out = match &self.public_ip {
             Some(old) if *old != ip => vec![status_incident(
                 now,
-                MetricId::Reachability,
+                MetricId::PublicIp,
                 "wan",
                 Health::Warn,
                 format!("public IP changed {old} → {ip}"),
@@ -761,7 +768,7 @@ impl AppState {
         match health.update(now, raw) {
             Some(Health::Ok) => vec![status_incident(
                 now,
-                MetricId::Throughput,
+                MetricId::Bufferbloat,
                 "bufferbloat",
                 Health::Ok,
                 "bufferbloat cleared".to_string(),
@@ -769,7 +776,7 @@ impl AppState {
             Some(sev) => {
                 let inc = Incident::new(
                     now,
-                    MetricId::Throughput,
+                    MetricId::Bufferbloat,
                     sev,
                     format!("bufferbloat +{delta:.0}ms under load"),
                 )
@@ -808,7 +815,7 @@ impl AppState {
         };
         vec![status_incident(
             now,
-            MetricId::Reachability,
+            MetricId::CaptivePortal,
             "captive",
             sev,
             msg,
@@ -1072,7 +1079,7 @@ impl AppState {
             MetricId::Dns => Health::worst_of(self.resolvers.values().map(|r| r.health.current())),
             // Capacity and bufferbloat share the Throughput panel: a link can be "up and
             // fast" yet unusable under load, so the border must reflect the worse of the two.
-            MetricId::Throughput => {
+            MetricId::Throughput | MetricId::Bufferbloat => {
                 let capacity = self
                     .throughput
                     .health
@@ -1085,8 +1092,10 @@ impl AppState {
                 .health
                 .as_ref()
                 .map_or(Health::Ok, |d| d.current()),
-            // The "Link & Reachability" panel combines the wireless link and all endpoints.
-            MetricId::Link | MetricId::Reachability => {
+            // The "Link & Reachability" panel combines the wireless link, all endpoints, and
+            // the captive-portal verdict — a sign-in wall is a total loss of web access even
+            // while every endpoint below HTTP answers.
+            MetricId::Link | MetricId::Reachability | MetricId::CaptivePortal => {
                 let link = self
                     .link
                     .health
@@ -1094,11 +1103,18 @@ impl AppState {
                     .map_or(Health::Ok, |d| d.current());
                 let reach =
                     Health::worst_of(self.reachability.values().map(|r| r.health.current()));
-                link.worst(reach)
+                let captive = self
+                    .captive_health
+                    .as_ref()
+                    .map_or(Health::Ok, |d| d.current());
+                link.worst(reach).worst(captive)
             }
             // Self-reporting, not a network panel. A broken log must not turn the overall
             // verdict red — the network is fine, the disk isn't; the header badge says so.
-            MetricId::Log => Health::Ok,
+            // A new WAN address is news, not a fault: nothing is broken, so nothing goes
+            // red. Same for the dashboard's own log — the network is fine, the disk isn't,
+            // and the header badge is where that belongs.
+            MetricId::PublicIp | MetricId::Log => Health::Ok,
         }
     }
 
@@ -1898,6 +1914,114 @@ mod tests {
         assert_eq!(cleared.len(), 1, "{cleared:#?}");
         assert_eq!(cleared[0].severity, Health::Ok);
         assert!(!s.captive_portal);
+    }
+
+    // --- metric identity ---
+
+    #[test]
+    fn each_concern_is_logged_under_its_own_metric_id() {
+        let mut s = AppState::new(test_config());
+        let mut c = Clock::new();
+
+        let bloat = drive(&mut s, &mut c, 2, || Sample::Bufferbloat {
+            idle_ms: 10.0,
+            loaded_ms: 400.0,
+        });
+        assert_eq!(bloat[0].metric, MetricId::Bufferbloat, "{bloat:#?}");
+
+        let portal = drive(&mut s, &mut c, 2, || Sample::CaptivePortal {
+            detected: true,
+        });
+        assert_eq!(portal[0].metric, MetricId::CaptivePortal, "{portal:#?}");
+
+        s.apply_sample(
+            c.tick(),
+            Sample::PublicIp {
+                ip: "1.2.3.4".into(),
+            },
+        );
+        let wan = s.apply_sample(
+            c.tick(),
+            Sample::PublicIp {
+                ip: "5.6.7.8".into(),
+            },
+        );
+        assert_eq!(wan[0].metric, MetricId::PublicIp, "{wan:#?}");
+
+        // Capacity keeps the generic id — it is what "throughput" has always meant.
+        let cap = drive(&mut s, &mut c, 2, || Sample::ThroughputProbe { mbps: 0.5 });
+        assert_eq!(cap[0].metric, MetricId::Throughput, "{cap:#?}");
+    }
+
+    #[test]
+    fn a_split_out_metric_still_colours_the_panel_it_is_drawn_in() {
+        let mut s = AppState::new(test_config());
+        let mut c = Clock::new();
+        drive(&mut s, &mut c, 2, || Sample::Bufferbloat {
+            idle_ms: 10.0,
+            loaded_ms: 400.0,
+        });
+        drive(&mut s, &mut c, 2, || Sample::CaptivePortal {
+            detected: true,
+        });
+
+        assert_eq!(
+            s.panel_health(MetricId::Bufferbloat),
+            s.panel_health(MetricId::Throughput),
+            "bufferbloat is drawn in the throughput panel; one border, one verdict"
+        );
+        assert_eq!(s.panel_health(MetricId::Bufferbloat), Health::Crit);
+        assert_eq!(
+            s.panel_health(MetricId::CaptivePortal),
+            s.panel_health(MetricId::Reachability),
+            "the portal is drawn in the link & reachability panel"
+        );
+    }
+
+    #[test]
+    fn a_captive_portal_turns_its_panel_red() {
+        let mut s = AppState::new(test_config());
+        let mut c = Clock::new();
+        assert_eq!(s.panel_health(MetricId::Reachability), Health::Ok);
+        drive(&mut s, &mut c, 2, || Sample::CaptivePortal {
+            detected: true,
+        });
+        assert_eq!(
+            s.panel_health(MetricId::Reachability),
+            Health::Crit,
+            "a sign-in wall is a total loss of web access; the border must say so"
+        );
+        assert_eq!(s.overall_health(), Health::Crit);
+
+        drive(&mut s, &mut c, 2, || Sample::CaptivePortal {
+            detected: false,
+        });
+        assert_eq!(s.panel_health(MetricId::Reachability), Health::Ok);
+    }
+
+    #[test]
+    fn a_changed_public_ip_does_not_turn_a_panel_red() {
+        let mut s = AppState::new(test_config());
+        let mut c = Clock::new();
+        s.apply_sample(
+            c.tick(),
+            Sample::PublicIp {
+                ip: "1.2.3.4".into(),
+            },
+        );
+        let wan = s.apply_sample(
+            c.tick(),
+            Sample::PublicIp {
+                ip: "5.6.7.8".into(),
+            },
+        );
+        assert_eq!(wan.len(), 1);
+        assert_eq!(
+            s.panel_health(MetricId::PublicIp),
+            Health::Ok,
+            "a new address is news, not a fault — nothing is broken"
+        );
+        assert_eq!(s.overall_health(), Health::Ok);
     }
 
     #[test]

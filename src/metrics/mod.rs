@@ -26,8 +26,16 @@ pub enum MetricId {
     Jitter,
     Dns,
     Routing,
+    /// Capacity — how much the link can carry.
     Throughput,
+    /// Latency added under load. Drawn in the throughput panel, but a distinct fault with a
+    /// distinct fix, so it is logged and correlated under its own name.
+    Bufferbloat,
     Reachability,
+    /// Web traffic is being intercepted and a sign-in is required.
+    CaptivePortal,
+    /// The WAN-side address changed — an event rather than a fault (see [`MetricId::label`]).
+    PublicIp,
     Link,
     /// The dashboard reporting on itself — currently only "the incident log is unwritable".
     Log,
@@ -43,7 +51,10 @@ impl MetricId {
             MetricId::Dns => "dns",
             MetricId::Routing => "routing",
             MetricId::Throughput => "throughput",
+            MetricId::Bufferbloat => "bufferbloat",
             MetricId::Reachability => "reachability",
+            MetricId::CaptivePortal => "captive portal",
+            MetricId::PublicIp => "public ip",
             MetricId::Link => "link",
             MetricId::Log => "log",
         }
