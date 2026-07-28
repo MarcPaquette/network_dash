@@ -186,6 +186,9 @@ pub struct AppState {
     pub vpn: bool,
     pub events: VecDeque<Incident>,
     pub max_events: usize,
+    /// First incident-log write failure, kept so the header can say the on-disk history is
+    /// no longer being recorded. `None` means the log is healthy (or was never opened).
+    pub log_error: Option<String>,
     /// How many newest incidents are scrolled past in the events feed.
     pub events_scroll: usize,
     /// Whether the keybinding help overlay is showing.
@@ -215,6 +218,7 @@ impl AppState {
             vpn: false,
             events: VecDeque::new(),
             max_events: 200,
+            log_error: None,
             events_scroll: 0,
             show_help: false,
             theme_picker: None,
@@ -304,19 +308,34 @@ impl AppState {
         let mut out = Vec::new();
 
         // Latency (uses gateway or internet thresholds depending on the target's role).
+        // A timed-out ping is a latency failure in its own right: evaluating the *stale*
+        // last-good RTT would keep reporting "healthy" straight through a total outage.
         let lat_thr = *t.latency_thresholds(&cfg);
-        if let Some(latest) = t.latency_ms.latest() {
-            let raw = lat_thr.evaluate(latest);
-            if let Some(sev) = t.latency_health.update(raw) {
-                out.push(incident_for(
-                    now,
-                    MetricId::Latency,
-                    target,
-                    sev,
-                    latest,
-                    "ms",
-                    &lat_thr,
-                ));
+        match rtt_ms {
+            Some(rtt) => {
+                let raw = lat_thr.evaluate(rtt);
+                if let Some(sev) = t.latency_health.update(raw) {
+                    out.push(incident_for(
+                        now,
+                        MetricId::Latency,
+                        target,
+                        sev,
+                        rtt,
+                        "ms",
+                        &lat_thr,
+                    ));
+                }
+            }
+            None => {
+                if let Some(sev) = t.latency_health.update(Health::Crit) {
+                    out.push(status_incident(
+                        now,
+                        MetricId::Latency,
+                        target,
+                        sev,
+                        format!("latency probe timed out ({target})"),
+                    ));
+                }
             }
         }
 
@@ -561,12 +580,8 @@ impl AppState {
     fn apply_throughput_probe(&mut self, now: DateTime<Utc>, mbps: f64) -> Vec<Incident> {
         let cfg = self.config.clone();
         self.throughput.last_mbps = Some(mbps);
-        let floor = cfg.throughput.floor_mbps;
-        let raw = if mbps < floor {
-            Health::Warn
-        } else {
-            Health::Ok
-        };
+        let thr = cfg.thresholds.throughput;
+        let raw = thr.evaluate(mbps);
         let health = self
             .throughput
             .health
@@ -581,16 +596,25 @@ impl AppState {
                     "throughput recovered".to_string(),
                 )]
             }
-            Some(sev) => vec![
-                Incident::new(
-                    now,
-                    MetricId::Throughput,
-                    sev,
-                    format!("throughput {mbps:.0}Mbps below floor"),
-                )
-                .with_value(mbps, "Mbps")
-                .with_threshold(floor),
-            ],
+            Some(sev) => {
+                // Report the bound actually crossed, so a crit incident doesn't quote the
+                // warn floor and read as a milder problem than it is.
+                let crossed = if sev == Health::Crit {
+                    thr.crit
+                } else {
+                    thr.warn
+                };
+                vec![
+                    Incident::new(
+                        now,
+                        MetricId::Throughput,
+                        sev,
+                        format!("throughput {mbps:.0}Mbps below floor"),
+                    )
+                    .with_value(mbps, "Mbps")
+                    .with_threshold(crossed),
+                ]
+            }
             None => Vec::new(),
         }
     }
@@ -680,6 +704,24 @@ impl AppState {
         }
     }
 
+    /// Record that writing to the incident log failed.
+    ///
+    /// Only the *first* failure is reported: the causes (full disk, read-only volume,
+    /// revoked permissions) are all sticky, so re-reporting would emit one event per
+    /// incident forever and bury the network problems the feed exists to show.
+    pub fn note_log_error(&mut self, now: DateTime<Utc>, err: &str) {
+        if self.log_error.is_some() {
+            return;
+        }
+        self.log_error = Some(err.to_string());
+        self.push_event(Incident::new(
+            now,
+            MetricId::Log,
+            Health::Warn,
+            format!("incident log unwritable, history is not being saved: {err}"),
+        ));
+    }
+
     fn push_event(&mut self, incident: Incident) {
         self.events.push_front(incident);
         while self.events.len() > self.max_events {
@@ -750,11 +792,16 @@ impl AppState {
                 Health::worst_of(self.targets.values().map(|t| t.loss_health.current()))
             }
             MetricId::Dns => Health::worst_of(self.resolvers.values().map(|r| r.health.current())),
-            MetricId::Throughput => self
-                .throughput
-                .health
-                .as_ref()
-                .map_or(Health::Ok, |d| d.current()),
+            // Capacity and bufferbloat share the Throughput panel: a link can be "up and
+            // fast" yet unusable under load, so the border must reflect the worse of the two.
+            MetricId::Throughput => {
+                let capacity = self
+                    .throughput
+                    .health
+                    .as_ref()
+                    .map_or(Health::Ok, |d| d.current());
+                capacity.worst(self.throughput.bufferbloat_health_current())
+            }
             MetricId::Routing => self
                 .routing
                 .health
@@ -771,6 +818,9 @@ impl AppState {
                     Health::worst_of(self.reachability.values().map(|r| r.health.current()));
                 link.worst(reach)
             }
+            // Self-reporting, not a network panel. A broken log must not turn the overall
+            // verdict red — the network is fine, the disk isn't; the header badge says so.
+            MetricId::Log => Health::Ok,
         }
     }
 
@@ -904,6 +954,23 @@ mod tests {
     }
 
     #[test]
+    fn total_outage_does_not_report_healthy_latency() {
+        let mut s = AppState::new(test_config());
+        // One good reply, then the link dies entirely.
+        s.apply_sample(now(), latency("1.1.1.1", 20.0));
+        for _ in 0..4 {
+            s.apply_sample(now(), timeout("1.1.1.1"));
+        }
+        // Loss obviously goes bad...
+        assert_eq!(s.panel_health(MetricId::Loss), Health::Crit);
+        // ...and latency must not keep reporting the stale last-good RTT as healthy.
+        assert!(
+            s.panel_health(MetricId::Latency) > Health::Ok,
+            "a timed-out ping is not a healthy latency"
+        );
+    }
+
+    #[test]
     fn healthy_latency_produces_no_incidents() {
         let mut s = AppState::new(test_config());
         for _ in 0..5 {
@@ -992,10 +1059,22 @@ mod tests {
         let a = s.apply_sample(now(), timeout("1.1.1.1"));
         assert!(a.is_empty());
         let b = s.apply_sample(now(), timeout("1.1.1.1"));
-        assert_eq!(b.len(), 1);
-        assert_eq!(b[0].metric, MetricId::Loss);
-        assert_eq!(b[0].severity, Health::Crit);
+        // Sustained timeouts are both a loss problem and a latency problem, so the second
+        // drop commits each debouncer and emits one incident for each.
+        let loss = b
+            .iter()
+            .find(|i| i.metric == MetricId::Loss)
+            .expect("a loss incident");
+        assert_eq!(loss.severity, Health::Crit);
         assert_eq!(s.panel_health(MetricId::Loss), Health::Crit);
+
+        let lat = b
+            .iter()
+            .find(|i| i.metric == MetricId::Latency)
+            .expect("a latency incident");
+        assert_eq!(lat.severity, Health::Crit);
+        assert!(lat.message.contains("timed out"));
+        assert_eq!(b.len(), 2);
     }
 
     #[test]
@@ -1273,6 +1352,22 @@ mod tests {
     }
 
     #[test]
+    fn bufferbloat_crit_reddens_the_throughput_panel() {
+        let mut s = AppState::new(test_config()); // bufferbloat warn 100 / crit 300 ms
+        // +380 ms under load → Crit once debounced.
+        let sample = Sample::Bufferbloat {
+            idle_ms: 20.0,
+            loaded_ms: 400.0,
+        };
+        s.apply_sample(now(), sample.clone());
+        let out = s.apply_sample(now(), sample);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].severity, Health::Crit);
+        // The incident is worthless if the panel it belongs to still looks healthy.
+        assert_eq!(s.panel_health(MetricId::Throughput), Health::Crit);
+    }
+
+    #[test]
     fn route_info_populates_interface_mtu_and_vpn() {
         let mut s = AppState::new(test_config());
         s.apply_route_info(&crate::net::RouteInfo {
@@ -1303,14 +1398,31 @@ mod tests {
     #[test]
     fn throughput_probe_below_floor_warns() {
         let mut c = test_config();
-        c.throughput.floor_mbps = 100.0;
+        c.thresholds.throughput = Thresholds::lower_is_worse(100.0, 25.0);
         let mut s = AppState::new(c);
         s.apply_sample(now(), Sample::ThroughputProbe { mbps: 50.0 });
         let out = s.apply_sample(now(), Sample::ThroughputProbe { mbps: 40.0 });
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].severity, Health::Warn);
         assert_eq!(out[0].value, Some(40.0));
+        assert_eq!(out[0].threshold, Some(100.0));
         assert_eq!(s.throughput.last_mbps, Some(40.0));
+    }
+
+    #[test]
+    fn throughput_far_below_floor_is_crit() {
+        let mut c = test_config();
+        c.thresholds.throughput = Thresholds::lower_is_worse(100.0, 25.0);
+        let mut s = AppState::new(c);
+        // 4 Mbps on a link expected to do 100 is not a "warning", it is unusable.
+        s.apply_sample(now(), Sample::ThroughputProbe { mbps: 5.0 });
+        let out = s.apply_sample(now(), Sample::ThroughputProbe { mbps: 4.0 });
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].severity, Health::Crit);
+        assert_eq!(out[0].value, Some(4.0));
+        // The reported threshold must be the one actually crossed, not the warn bound.
+        assert_eq!(out[0].threshold, Some(25.0));
+        assert_eq!(s.panel_health(MetricId::Throughput), Health::Crit);
     }
 
     #[test]
@@ -1433,6 +1545,37 @@ mod tests {
             s.events.len() <= 3,
             "events ring exceeded cap: {}",
             s.events.len()
+        );
+    }
+
+    #[test]
+    fn log_write_failure_surfaces_once() {
+        let mut s = AppState::new(test_config());
+        s.note_log_error(now(), "no space left on device");
+        s.note_log_error(now(), "no space left on device");
+        s.note_log_error(now(), "still broken");
+
+        assert_eq!(
+            s.log_error.as_deref(),
+            Some("no space left on device"),
+            "the first failure is the diagnostic one"
+        );
+        let reports: Vec<_> = s
+            .events
+            .iter()
+            .filter(|e| e.metric == MetricId::Log)
+            .collect();
+        assert_eq!(
+            reports.len(),
+            1,
+            "one self-report, not one per failed write — otherwise a broken disk floods \
+             the feed and buries the network events it is there to show"
+        );
+        assert_eq!(reports[0].severity, Health::Warn);
+        assert!(
+            reports[0].message.contains("no space left on device"),
+            "got: {}",
+            reports[0].message
         );
     }
 }

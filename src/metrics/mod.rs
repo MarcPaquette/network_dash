@@ -29,6 +29,8 @@ pub enum MetricId {
     Throughput,
     Reachability,
     Link,
+    /// The dashboard reporting on itself — currently only "the incident log is unwritable".
+    Log,
 }
 
 impl MetricId {
@@ -43,6 +45,7 @@ impl MetricId {
             MetricId::Throughput => "throughput",
             MetricId::Reachability => "reachability",
             MetricId::Link => "link",
+            MetricId::Log => "log",
         }
     }
 }

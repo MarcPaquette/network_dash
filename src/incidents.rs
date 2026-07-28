@@ -84,18 +84,34 @@ impl Incident {
 /// Append-only writer for incidents over any [`Write`] sink.
 pub struct IncidentLog<W: Write> {
     sink: W,
+    written: u64,
 }
 
 impl<W: Write> IncidentLog<W> {
     pub fn new(sink: W) -> Self {
-        Self { sink }
+        Self { sink, written: 0 }
+    }
+
+    /// Same as [`IncidentLog::new`], but starting the byte count at `written` — used when
+    /// reopening a log that already has content on disk.
+    pub fn resuming(sink: W, written: u64) -> Self {
+        Self { sink, written }
+    }
+
+    /// Bytes appended through this log, including any pre-existing content it resumed.
+    pub fn written(&self) -> u64 {
+        self.written
     }
 
     /// Append one incident as a JSONL line and flush.
     pub fn append(&mut self, incident: &Incident) -> io::Result<()> {
         let line = incident.to_jsonl_line().map_err(io::Error::other)?;
         self.sink.write_all(line.as_bytes())?;
-        self.sink.flush()
+        self.sink.flush()?;
+        // Counted only after the write lands, so a failed append can't inflate the count
+        // and trigger a rotation over bytes that were never stored.
+        self.written += line.len() as u64;
+        Ok(())
     }
 
     /// Recover the underlying sink (useful in tests).
@@ -114,13 +130,71 @@ impl IncidentLog<std::fs::File> {
             .create(true)
             .append(true)
             .open(path)?;
-        Ok(Self::new(file))
+        let existing = file.metadata().map(|m| m.len()).unwrap_or(0);
+        Ok(Self::resuming(file, existing))
     }
 
     /// Default on-disk log path (`<data_local_dir>/network_dash/incidents.jsonl`).
     pub fn default_path() -> Option<PathBuf> {
         directories::ProjectDirs::from("", "", "network_dash")
             .map(|d| d.data_local_dir().join("incidents.jsonl"))
+    }
+}
+
+/// Rotate the log once it passes ~5 MB. At roughly 200 bytes per incident that is ~25k
+/// events, far more history than anyone reads, and it bounds the log at 2x the cap.
+pub const DEFAULT_MAX_BYTES: u64 = 5 * 1024 * 1024;
+
+/// File-backed incident log with single-generation size rotation: once the live file
+/// passes `max_bytes` it is renamed to `<name>.1` (replacing any previous `.1`) and a
+/// fresh file is opened. A dashboard left running for months therefore costs a bounded
+/// amount of disk instead of growing without limit.
+pub struct RotatingLog {
+    path: PathBuf,
+    max_bytes: u64,
+    log: IncidentLog<std::fs::File>,
+}
+
+impl RotatingLog {
+    /// Open `path` in append mode, resuming its current size so the cap survives restarts.
+    pub fn open(path: &Path, max_bytes: u64) -> io::Result<Self> {
+        Ok(Self {
+            path: path.to_path_buf(),
+            max_bytes: max_bytes.max(1),
+            log: IncidentLog::open_append(path)?,
+        })
+    }
+
+    /// Open the default on-disk log at the default size cap.
+    pub fn open_default() -> Option<Self> {
+        let path = IncidentLog::default_path()?;
+        Self::open(&path, DEFAULT_MAX_BYTES).ok()
+    }
+
+    /// Bytes in the live generation.
+    pub fn written(&self) -> u64 {
+        self.log.written()
+    }
+
+    /// The retired-generation path (`<name>.1`).
+    fn rolled_path(&self) -> PathBuf {
+        let mut name = self.path.as_os_str().to_os_string();
+        name.push(".1");
+        PathBuf::from(name)
+    }
+
+    /// Append one incident, rolling the file over first if it is already at the cap.
+    pub fn append(&mut self, incident: &Incident) -> io::Result<()> {
+        if self.log.written() >= self.max_bytes {
+            self.roll()?;
+        }
+        self.log.append(incident)
+    }
+
+    fn roll(&mut self) -> io::Result<()> {
+        std::fs::rename(&self.path, self.rolled_path())?;
+        self.log = IncidentLog::open_append(&self.path)?;
+        Ok(())
     }
 }
 
@@ -179,6 +253,93 @@ mod tests {
     fn timestamp_serializes_as_rfc3339() {
         let line = sample().to_jsonl_line().unwrap();
         assert!(line.contains("2026-07-20T14:20:03"), "got: {line}");
+    }
+
+    /// A unique scratch directory under the OS temp dir, removed by the caller.
+    fn scratch(tag: &str) -> PathBuf {
+        static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir =
+            std::env::temp_dir().join(format!("network_dash-{tag}-{}-{n}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn log_tracks_bytes_written() {
+        let mut log = IncidentLog::new(Vec::new());
+        let line_len = sample().to_jsonl_line().unwrap().len() as u64;
+        assert_eq!(log.written(), 0);
+        log.append(&sample()).unwrap();
+        log.append(&sample()).unwrap();
+        assert_eq!(log.written(), line_len * 2);
+    }
+
+    #[test]
+    fn log_rotates_when_over_size_cap() {
+        let dir = scratch("rotate");
+        let path = dir.join("incidents.jsonl");
+        let line_len = sample().to_jsonl_line().unwrap().len() as u64;
+        // A cap of exactly two lines: the third append finds the file at the cap and rolls.
+        let mut log = RotatingLog::open(&path, line_len * 2).unwrap();
+        for _ in 0..3 {
+            log.append(&sample()).unwrap();
+        }
+
+        let rolled = dir.join("incidents.jsonl.1");
+        assert!(rolled.exists(), "the previous generation must be kept");
+        assert_eq!(
+            std::fs::read_to_string(&rolled).unwrap().lines().count(),
+            2,
+            "the retired generation holds everything written before the roll"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap().lines().count(),
+            1,
+            "the live generation restarts empty and holds the triggering incident"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn rotating_log_resumes_an_existing_file_without_truncating_it() {
+        let dir = scratch("resume");
+        let path = dir.join("incidents.jsonl");
+        {
+            let mut log = RotatingLog::open(&path, 1_000_000).unwrap();
+            log.append(&sample()).unwrap();
+        }
+        // Reopening must count what is already on disk, or the cap resets every launch and
+        // an always-restarting dashboard grows the file forever.
+        let log = RotatingLog::open(&path, 1_000_000).unwrap();
+        assert_eq!(
+            log.written(),
+            sample().to_jsonl_line().unwrap().len() as u64
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn append_error_is_reported() {
+        /// A sink whose every write fails, standing in for a full or read-only disk.
+        struct Broken;
+        impl Write for Broken {
+            fn write(&mut self, _buf: &[u8]) -> io::Result<usize> {
+                Err(io::Error::new(io::ErrorKind::StorageFull, "no space left"))
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let mut log = IncidentLog::new(Broken);
+        let err = log
+            .append(&sample())
+            .expect_err("a failed write must surface");
+        assert_eq!(err.kind(), io::ErrorKind::StorageFull);
+        // A write that never landed must not count toward the rotation cap.
+        assert_eq!(log.written(), 0);
     }
 
     #[test]
