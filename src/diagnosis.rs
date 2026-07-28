@@ -630,7 +630,8 @@ mod tests {
         c.targets.internet = vec!["1.1.1.1".into()];
         c.targets.gateway = Some("192.168.1.1".into());
         c.targets.gateway_auto = false;
-        c.thresholds.debounce_samples = 2;
+        c.thresholds.trip_after_secs = 0.0;
+        c.thresholds.clear_after_secs = 0.0;
         c
     }
 

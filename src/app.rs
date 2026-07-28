@@ -63,9 +63,9 @@ impl TargetState {
             latency_ms: Series::new(t.history_len),
             loss: LossWindow::new(t.loss_window),
             loss_history: Series::new(t.history_len),
-            latency_health: Debouncer::new(Health::Ok, t.debounce_samples),
-            jitter_health: Debouncer::new(Health::Ok, t.debounce_samples),
-            loss_health: Debouncer::new(Health::Ok, t.debounce_samples),
+            latency_health: Debouncer::new(Health::Ok, t.trip_after(), t.clear_after()),
+            jitter_health: Debouncer::new(Health::Ok, t.trip_after(), t.clear_after()),
+            loss_health: Debouncer::new(Health::Ok, t.trip_after(), t.clear_after()),
         }
     }
 
@@ -410,7 +410,7 @@ impl AppState {
         match rtt_ms {
             Some(rtt) => {
                 let raw = lat_thr.evaluate(rtt);
-                if let Some(sev) = t.latency_health.update(raw) {
+                if let Some(sev) = t.latency_health.update(now, raw) {
                     out.push(incident_for(
                         now,
                         MetricId::Latency,
@@ -423,7 +423,7 @@ impl AppState {
                 }
             }
             None => {
-                if let Some(sev) = t.latency_health.update(Health::Crit) {
+                if let Some(sev) = t.latency_health.update(now, Health::Crit) {
                     out.push(status_incident(
                         now,
                         MetricId::Latency,
@@ -439,7 +439,7 @@ impl AppState {
         let jit_thr = cfg.thresholds.jitter;
         if let Some(jitter) = t.latency_ms.jitter() {
             let raw = jit_thr.evaluate(jitter);
-            if let Some(sev) = t.jitter_health.update(raw) {
+            if let Some(sev) = t.jitter_health.update(now, raw) {
                 out.push(incident_for(
                     now,
                     MetricId::Jitter,
@@ -457,7 +457,7 @@ impl AppState {
         let loss_pct = t.loss.loss_pct();
         t.loss_history.push(loss_pct);
         let raw = loss_thr.evaluate(loss_pct);
-        if let Some(sev) = t.loss_health.update(raw) {
+        if let Some(sev) = t.loss_health.update(now, raw) {
             out.push(incident_for(
                 now,
                 MetricId::Loss,
@@ -486,7 +486,11 @@ impl AppState {
             .or_insert_with(|| ResolverState {
                 latency_ms: Series::new(cfg.thresholds.history_len),
                 last_ok: true,
-                health: Debouncer::new(Health::Ok, cfg.thresholds.debounce_samples),
+                health: Debouncer::new(
+                    Health::Ok,
+                    cfg.thresholds.trip_after(),
+                    cfg.thresholds.clear_after(),
+                ),
             });
         let raw = match latency_ms {
             Some(ms) => {
@@ -501,7 +505,7 @@ impl AppState {
         };
         let last_ok = state.last_ok;
         let latest = state.latency_ms.latest().unwrap_or(0.0);
-        match state.health.update(raw) {
+        match state.health.update(now, raw) {
             Some(sev) if sev == Health::Ok => vec![status_incident(
                 now,
                 MetricId::Dns,
@@ -543,11 +547,15 @@ impl AppState {
             .entry(endpoint.to_string())
             .or_insert_with(|| ReachState {
                 ok: true,
-                health: Debouncer::new(Health::Ok, cfg.thresholds.debounce_samples),
+                health: Debouncer::new(
+                    Health::Ok,
+                    cfg.thresholds.trip_after(),
+                    cfg.thresholds.clear_after(),
+                ),
             });
         state.ok = ok;
         let raw = if ok { Health::Ok } else { Health::Crit };
-        match state.health.update(raw) {
+        match state.health.update(now, raw) {
             Some(Health::Ok) => {
                 vec![status_incident(
                     now,
@@ -612,11 +620,14 @@ impl AppState {
             .push(delta);
         let thr = cfg.thresholds.bufferbloat;
         let raw = thr.evaluate(delta);
-        let health = self
-            .throughput
-            .bufferbloat_health
-            .get_or_insert_with(|| Debouncer::new(Health::Ok, cfg.thresholds.debounce_samples));
-        match health.update(raw) {
+        let health = self.throughput.bufferbloat_health.get_or_insert_with(|| {
+            Debouncer::new(
+                Health::Ok,
+                cfg.thresholds.trip_after(),
+                cfg.thresholds.clear_after(),
+            )
+        });
+        match health.update(now, raw) {
             Some(Health::Ok) => vec![status_incident(
                 now,
                 MetricId::Throughput,
@@ -686,11 +697,14 @@ impl AppState {
             .push(mbps);
         let thr = cfg.thresholds.throughput;
         let raw = thr.evaluate(mbps);
-        let health = self
-            .throughput
-            .health
-            .get_or_insert_with(|| Debouncer::new(Health::Ok, cfg.thresholds.debounce_samples));
-        match health.update(raw) {
+        let health = self.throughput.health.get_or_insert_with(|| {
+            Debouncer::new(
+                Health::Ok,
+                cfg.thresholds.trip_after(),
+                cfg.thresholds.clear_after(),
+            )
+        });
+        match health.update(now, raw) {
             Some(Health::Ok) => {
                 vec![status_incident(
                     now,
@@ -762,11 +776,14 @@ impl AppState {
                 .push(n);
         }
         let raw = thr.evaluate(rssi);
-        let health = self
-            .link
-            .health
-            .get_or_insert_with(|| Debouncer::new(Health::Ok, cfg.thresholds.debounce_samples));
-        match health.update(raw) {
+        let health = self.link.health.get_or_insert_with(|| {
+            Debouncer::new(
+                Health::Ok,
+                cfg.thresholds.trip_after(),
+                cfg.thresholds.clear_after(),
+            )
+        });
+        match health.update(now, raw) {
             Some(sev) => vec![incident_for(
                 now,
                 MetricId::Link,
@@ -802,16 +819,19 @@ impl AppState {
         } else {
             Health::Ok
         };
-        let health = self
-            .routing
-            .health
-            .get_or_insert_with(|| Debouncer::new(Health::Ok, cfg.thresholds.debounce_samples));
+        let health = self.routing.health.get_or_insert_with(|| {
+            Debouncer::new(
+                Health::Ok,
+                cfg.thresholds.trip_after(),
+                cfg.thresholds.clear_after(),
+            )
+        });
         let message = match raw {
             Health::Crit => format!("route to {target} unreachable"),
             Health::Warn => format!("route to {target} changed ({hops} hops)"),
             Health::Ok => format!("route to {target} stable ({hops} hops)"),
         };
-        match health.update(raw) {
+        match health.update(now, raw) {
             Some(sev) => vec![status_incident(
                 now,
                 MetricId::Routing,
@@ -1003,14 +1023,38 @@ mod tests {
         Utc.with_ymd_and_hms(2026, 7, 20, 14, 0, 0).unwrap()
     }
 
+    /// A clock that advances one second per sample, matching the real ping cadence.
+    ///
+    /// Debouncing is time-based, so a frozen clock can never commit a transition — every
+    /// test that expects one has to let time pass, exactly as the running app does.
+    struct Clock(DateTime<Utc>);
+
+    impl Clock {
+        fn new() -> Self {
+            Self(now())
+        }
+
+        /// The current instant, then advance a second.
+        fn tick(&mut self) -> DateTime<Utc> {
+            let at = self.0;
+            self.0 += chrono::Duration::seconds(1);
+            at
+        }
+    }
+
     /// Config with a fast debounce and small windows for deterministic tests. Jitter
     /// thresholds are set out of reach so latency/loss tests are not perturbed by the
     /// jitter that large latency swings naturally produce; a dedicated test covers jitter.
+    ///
+    /// The 1-second dwells pair with [`Clock`]: a change is committed by the second
+    /// differing sample, which keeps these tests reading as "one blip is ignored, two in a
+    /// row are believed".
     fn test_config() -> Config {
         let mut c = Config::default();
         c.targets.internet = vec!["1.1.1.1".into()];
         c.targets.gateway = None;
-        c.thresholds.debounce_samples = 2;
+        c.thresholds.trip_after_secs = 1.0;
+        c.thresholds.clear_after_secs = 1.0;
         c.thresholds.loss_window = 4;
         c.thresholds.history_len = 16;
         c.thresholds.jitter = Thresholds::higher_is_worse(10_000.0, 20_000.0);
@@ -1053,12 +1097,17 @@ mod tests {
         let t = now();
         s.tick(t); // healthy
         // One total outage inside the minute, then recovery — the minute was not "ok".
-        for _ in 0..4 {
-            s.apply_sample(t, timeout("1.1.1.1"));
+        // Seconds pass between samples (the debounce is a duration), but every one of them
+        // lands inside minute 0, so the whole episode belongs to a single bucket.
+        for i in 0..4 {
+            s.apply_sample(t + chrono::Duration::seconds(i), timeout("1.1.1.1"));
         }
         s.tick(t + chrono::Duration::seconds(10));
-        for _ in 0..8 {
-            s.apply_sample(t, latency("1.1.1.1", 10.0));
+        for i in 0..8 {
+            s.apply_sample(
+                t + chrono::Duration::seconds(10 + i),
+                latency("1.1.1.1", 10.0),
+            );
         }
         s.tick(t + chrono::Duration::seconds(50));
         assert_eq!(
@@ -1100,7 +1149,8 @@ mod tests {
         // Samples arrive far more often than renders under `--once`, and the strip must
         // still be populated for the panel to have anything to draw.
         let mut s = AppState::new(test_config());
-        s.apply_sample(now(), latency("1.1.1.1", 12.0));
+        let mut c = Clock::new();
+        s.apply_sample(c.tick(), latency("1.1.1.1", 12.0));
         assert_eq!(strip(&s).len(), 1);
     }
 
@@ -1109,9 +1159,13 @@ mod tests {
         let mut s = AppState::new(test_config());
         let t = now();
         s.tick(t); // minute 0: healthy
-        for _ in 0..4 {
-            // minute 1: total outage (each sample ticks the strip itself)
-            s.apply_sample(t + chrono::Duration::minutes(1), timeout("1.1.1.1"));
+        for i in 0..4 {
+            // minute 1: total outage (each sample ticks the strip itself). Spread across
+            // seconds so the debounce dwell elapses, but all still inside minute 1.
+            s.apply_sample(
+                t + chrono::Duration::minutes(1) + chrono::Duration::seconds(i),
+                timeout("1.1.1.1"),
+            );
         }
         s.tick(t + chrono::Duration::minutes(4)); // still down, after a 2-minute gap
         let r = s.availability_rollup();
@@ -1130,9 +1184,10 @@ mod tests {
     #[test]
     fn link_samples_accumulate_signal_history() {
         let mut s = AppState::new(test_config());
+        let mut c = Clock::new();
         for (rssi, noise) in [(-45.0, -92.0), (-52.0, -91.0), (-61.0, -90.0)] {
             s.apply_sample(
-                now(),
+                c.tick(),
                 Sample::Link {
                     rssi_dbm: Some(rssi),
                     noise_dbm: Some(noise),
@@ -1153,8 +1208,9 @@ mod tests {
         // The Wi-Fi probe returns `None` when the radio is off or the shell-out failed;
         // recording that as a data point would draw a cliff that never happened.
         let mut s = AppState::new(test_config());
+        let mut c = Clock::new();
         s.apply_sample(
-            now(),
+            c.tick(),
             Sample::Link {
                 rssi_dbm: None,
                 noise_dbm: None,
@@ -1168,8 +1224,9 @@ mod tests {
     #[test]
     fn capacity_probes_accumulate_history() {
         let mut s = AppState::new(test_config());
+        let mut c = Clock::new();
         for mbps in [420.0, 380.0, 55.0] {
-            s.apply_sample(now(), Sample::ThroughputProbe { mbps });
+            s.apply_sample(c.tick(), Sample::ThroughputProbe { mbps });
         }
         assert_eq!(
             s.throughput
@@ -1184,8 +1241,9 @@ mod tests {
     #[test]
     fn bufferbloat_samples_record_the_added_latency_not_the_raw_pair() {
         let mut s = AppState::new(test_config());
+        let mut c = Clock::new();
         s.apply_sample(
-            now(),
+            c.tick(),
             Sample::Bufferbloat {
                 idle_ms: 18.0,
                 loaded_ms: 143.0,
@@ -1203,8 +1261,9 @@ mod tests {
     fn bufferbloat_never_records_a_negative_delta() {
         // Loaded latency below idle is measurement noise, not a negative stall.
         let mut s = AppState::new(test_config());
+        let mut c = Clock::new();
         s.apply_sample(
-            now(),
+            c.tick(),
             Sample::Bufferbloat {
                 idle_ms: 30.0,
                 loaded_ms: 22.0,
@@ -1230,7 +1289,8 @@ mod tests {
     #[test]
     fn latency_sample_updates_history_and_loss() {
         let mut s = AppState::new(test_config());
-        s.apply_sample(now(), latency("1.1.1.1", 20.0));
+        let mut c = Clock::new();
+        s.apply_sample(c.tick(), latency("1.1.1.1", 20.0));
         let t = &s.targets["1.1.1.1"];
         assert_eq!(t.latency_ms.latest(), Some(20.0));
         assert_eq!(t.loss.len(), 1);
@@ -1239,9 +1299,10 @@ mod tests {
     #[test]
     fn loss_history_records_a_point_per_sample() {
         let mut s = AppState::new(test_config());
-        s.apply_sample(now(), latency("1.1.1.1", 20.0));
-        s.apply_sample(now(), timeout("1.1.1.1"));
-        s.apply_sample(now(), latency("1.1.1.1", 22.0));
+        let mut c = Clock::new();
+        s.apply_sample(c.tick(), latency("1.1.1.1", 20.0));
+        s.apply_sample(c.tick(), timeout("1.1.1.1"));
+        s.apply_sample(c.tick(), latency("1.1.1.1", 22.0));
         let t = &s.targets["1.1.1.1"];
         // One loss-% point per ping sample, so the panel can draw a line.
         assert_eq!(t.loss_history.len(), 3);
@@ -1252,7 +1313,8 @@ mod tests {
     #[test]
     fn timeout_records_loss_without_latency() {
         let mut s = AppState::new(test_config());
-        s.apply_sample(now(), timeout("1.1.1.1"));
+        let mut c = Clock::new();
+        s.apply_sample(c.tick(), timeout("1.1.1.1"));
         let t = &s.targets["1.1.1.1"];
         assert_eq!(t.latency_ms.latest(), None);
         assert_eq!(t.loss.len(), 1);
@@ -1261,10 +1323,11 @@ mod tests {
     #[test]
     fn total_outage_does_not_report_healthy_latency() {
         let mut s = AppState::new(test_config());
+        let mut c = Clock::new();
         // One good reply, then the link dies entirely.
-        s.apply_sample(now(), latency("1.1.1.1", 20.0));
+        s.apply_sample(c.tick(), latency("1.1.1.1", 20.0));
         for _ in 0..4 {
-            s.apply_sample(now(), timeout("1.1.1.1"));
+            s.apply_sample(c.tick(), timeout("1.1.1.1"));
         }
         // Loss obviously goes bad...
         assert_eq!(s.panel_health(MetricId::Loss), Health::Crit);
@@ -1278,8 +1341,9 @@ mod tests {
     #[test]
     fn healthy_latency_produces_no_incidents() {
         let mut s = AppState::new(test_config());
+        let mut c = Clock::new();
         for _ in 0..5 {
-            let inc = s.apply_sample(now(), latency("1.1.1.1", 12.0));
+            let inc = s.apply_sample(c.tick(), latency("1.1.1.1", 12.0));
             assert!(inc.is_empty());
         }
         assert_eq!(s.panel_health(MetricId::Latency), Health::Ok);
@@ -1288,8 +1352,9 @@ mod tests {
     #[test]
     fn single_spike_is_debounced_away() {
         let mut s = AppState::new(test_config());
-        s.apply_sample(now(), latency("1.1.1.1", 12.0));
-        let inc = s.apply_sample(now(), latency("1.1.1.1", 400.0)); // one spike
+        let mut c = Clock::new();
+        s.apply_sample(c.tick(), latency("1.1.1.1", 12.0));
+        let inc = s.apply_sample(c.tick(), latency("1.1.1.1", 400.0)); // one spike
         assert!(
             inc.is_empty(),
             "one spike should not commit with debounce 2"
@@ -1300,9 +1365,10 @@ mod tests {
     #[test]
     fn sustained_high_latency_emits_crit_incident() {
         let mut s = AppState::new(test_config());
-        let first = s.apply_sample(now(), latency("1.1.1.1", 400.0));
+        let mut c = Clock::new();
+        let first = s.apply_sample(c.tick(), latency("1.1.1.1", 400.0));
         assert!(first.is_empty(), "not yet committed");
-        let second = s.apply_sample(now(), latency("1.1.1.1", 410.0));
+        let second = s.apply_sample(c.tick(), latency("1.1.1.1", 410.0));
         assert_eq!(second.len(), 1);
         let inc = &second[0];
         assert_eq!(inc.metric, MetricId::Latency);
@@ -1317,13 +1383,65 @@ mod tests {
     #[test]
     fn latency_recovery_emits_ok_incident() {
         let mut s = AppState::new(test_config());
-        s.apply_sample(now(), latency("1.1.1.1", 400.0));
-        s.apply_sample(now(), latency("1.1.1.1", 410.0)); // -> Crit
-        s.apply_sample(now(), latency("1.1.1.1", 10.0));
-        let rec = s.apply_sample(now(), latency("1.1.1.1", 11.0)); // -> Ok
+        let mut c = Clock::new();
+        s.apply_sample(c.tick(), latency("1.1.1.1", 400.0));
+        s.apply_sample(c.tick(), latency("1.1.1.1", 410.0)); // -> Crit
+        s.apply_sample(c.tick(), latency("1.1.1.1", 10.0));
+        let rec = s.apply_sample(c.tick(), latency("1.1.1.1", 11.0)); // -> Ok
         assert_eq!(rec.len(), 1);
         assert_eq!(rec[0].severity, Health::Ok);
         assert_eq!(s.panel_health(MetricId::Latency), Health::Ok);
+    }
+
+    #[test]
+    fn recovery_is_slower_to_commit_than_the_fault_was() {
+        let mut cfg = test_config();
+        cfg.thresholds.trip_after_secs = 2.0;
+        cfg.thresholds.clear_after_secs = 10.0;
+        let mut s = AppState::new(cfg);
+        let mut c = Clock::new();
+
+        // Two seconds of bad latency is enough to report the fault.
+        assert!(
+            s.apply_sample(c.tick(), latency("1.1.1.1", 400.0))
+                .is_empty()
+        );
+        assert!(
+            s.apply_sample(c.tick(), latency("1.1.1.1", 400.0))
+                .is_empty()
+        );
+        let tripped = s.apply_sample(c.tick(), latency("1.1.1.1", 400.0));
+        assert_eq!(
+            tripped.len(),
+            1,
+            "reported once the 2s trip dwell has passed"
+        );
+        assert_eq!(s.panel_health(MetricId::Latency), Health::Crit);
+
+        // The same two seconds of health is *not* enough to call it recovered.
+        for _ in 0..3 {
+            assert!(
+                s.apply_sample(c.tick(), latency("1.1.1.1", 10.0))
+                    .is_empty()
+            );
+        }
+        assert_eq!(
+            s.panel_health(MetricId::Latency),
+            Health::Crit,
+            "a link that is briefly fine mid-flap is not fixed"
+        );
+
+        // Ten seconds of it is.
+        let mut recovered = Vec::new();
+        for _ in 0..8 {
+            recovered.extend(s.apply_sample(c.tick(), latency("1.1.1.1", 10.0)));
+        }
+        assert_eq!(
+            recovered.len(),
+            1,
+            "recovery reported after the 10s clear dwell"
+        );
+        assert_eq!(recovered[0].severity, Health::Ok);
     }
 
     #[test]
@@ -1331,9 +1449,10 @@ mod tests {
         let mut c = test_config();
         c.targets.gateway = Some("gw".into());
         let mut s = AppState::new(c);
+        let mut c = Clock::new();
         // 20ms is Ok for internet (<80) but Warn for the gateway (>=15).
-        s.apply_sample(now(), latency("gw", 20.0));
-        s.apply_sample(now(), latency("gw", 21.0));
+        s.apply_sample(c.tick(), latency("gw", 20.0));
+        s.apply_sample(c.tick(), latency("gw", 21.0));
         assert_eq!(s.targets["gw"].latency_health_current(), Health::Warn);
     }
 
@@ -1342,10 +1461,11 @@ mod tests {
         let mut c = test_config();
         c.thresholds.jitter = Thresholds::higher_is_worse(15.0, 40.0); // normal jitter bounds
         let mut s = AppState::new(c);
+        let mut c = Clock::new();
         // Oscillate 10/60ms: each latency is Ok (<80) but the swing drives jitter ~50ms.
-        s.apply_sample(now(), latency("1.1.1.1", 10.0));
-        s.apply_sample(now(), latency("1.1.1.1", 60.0));
-        let third = s.apply_sample(now(), latency("1.1.1.1", 10.0));
+        s.apply_sample(c.tick(), latency("1.1.1.1", 10.0));
+        s.apply_sample(c.tick(), latency("1.1.1.1", 60.0));
+        let third = s.apply_sample(c.tick(), latency("1.1.1.1", 10.0));
         let jitter: Vec<_> = third
             .iter()
             .filter(|i| i.metric == MetricId::Jitter)
@@ -1361,9 +1481,10 @@ mod tests {
     #[test]
     fn sustained_loss_emits_incident() {
         let mut s = AppState::new(test_config()); // loss_window 4 => 1 drop = 25% > crit 5%
-        let a = s.apply_sample(now(), timeout("1.1.1.1"));
+        let mut c = Clock::new();
+        let a = s.apply_sample(c.tick(), timeout("1.1.1.1"));
         assert!(a.is_empty());
-        let b = s.apply_sample(now(), timeout("1.1.1.1"));
+        let b = s.apply_sample(c.tick(), timeout("1.1.1.1"));
         // Sustained timeouts are both a loss problem and a latency problem, so the second
         // drop commits each debouncer and emits one incident for each.
         let loss = b
@@ -1385,8 +1506,9 @@ mod tests {
     #[test]
     fn overall_health_is_worst_panel() {
         let mut s = AppState::new(test_config());
-        s.apply_sample(now(), timeout("1.1.1.1"));
-        s.apply_sample(now(), timeout("1.1.1.1")); // loss -> Crit
+        let mut c = Clock::new();
+        s.apply_sample(c.tick(), timeout("1.1.1.1"));
+        s.apply_sample(c.tick(), timeout("1.1.1.1")); // loss -> Crit
         assert_eq!(s.overall_health(), Health::Crit);
     }
 
@@ -1494,15 +1616,16 @@ mod tests {
     #[test]
     fn dns_failure_emits_crit_incident() {
         let mut s = AppState::new(test_config());
+        let mut c = Clock::new();
         s.apply_sample(
-            now(),
+            c.tick(),
             Sample::Dns {
                 resolver: "cloudflare".into(),
                 latency_ms: None,
             },
         );
         let out = s.apply_sample(
-            now(),
+            c.tick(),
             Sample::Dns {
                 resolver: "cloudflare".into(),
                 latency_ms: None,
@@ -1518,15 +1641,16 @@ mod tests {
     #[test]
     fn dns_slow_lookup_warns_with_value() {
         let mut s = AppState::new(test_config()); // dns warn 100 / crit 300
+        let mut c = Clock::new();
         s.apply_sample(
-            now(),
+            c.tick(),
             Sample::Dns {
                 resolver: "system".into(),
                 latency_ms: Some(150.0),
             },
         );
         let out = s.apply_sample(
-            now(),
+            c.tick(),
             Sample::Dns {
                 resolver: "system".into(),
                 latency_ms: Some(160.0),
@@ -1540,15 +1664,16 @@ mod tests {
     #[test]
     fn reachability_down_then_recovers() {
         let mut s = AppState::new(test_config());
+        let mut c = Clock::new();
         s.apply_sample(
-            now(),
+            c.tick(),
             Sample::Reachability {
                 endpoint: "http".into(),
                 ok: false,
             },
         );
         let down = s.apply_sample(
-            now(),
+            c.tick(),
             Sample::Reachability {
                 endpoint: "http".into(),
                 ok: false,
@@ -1559,14 +1684,14 @@ mod tests {
         assert_eq!(s.panel_health(MetricId::Link), Health::Crit); // combined panel
 
         s.apply_sample(
-            now(),
+            c.tick(),
             Sample::Reachability {
                 endpoint: "http".into(),
                 ok: true,
             },
         );
         let up = s.apply_sample(
-            now(),
+            c.tick(),
             Sample::Reachability {
                 endpoint: "http".into(),
                 ok: true,
@@ -1579,27 +1704,28 @@ mod tests {
     #[test]
     fn captive_portal_sets_state_and_logs_on_change() {
         let mut s = AppState::new(test_config());
+        let mut c = Clock::new();
         // First "clear" reading matches the default — no spurious incident.
         assert!(
-            s.apply_sample(now(), Sample::CaptivePortal { detected: false })
+            s.apply_sample(c.tick(), Sample::CaptivePortal { detected: false })
                 .is_empty()
         );
         assert!(!s.captive_portal);
 
         // Detecting a portal flips the state and logs a crit incident.
-        let hit = s.apply_sample(now(), Sample::CaptivePortal { detected: true });
+        let hit = s.apply_sample(c.tick(), Sample::CaptivePortal { detected: true });
         assert!(s.captive_portal);
         assert_eq!(hit.len(), 1);
         assert_eq!(hit[0].severity, Health::Crit);
 
         // A steady portal reading does not re-log.
         assert!(
-            s.apply_sample(now(), Sample::CaptivePortal { detected: true })
+            s.apply_sample(c.tick(), Sample::CaptivePortal { detected: true })
                 .is_empty()
         );
 
         // Clearing flips back and logs recovery.
-        let cleared = s.apply_sample(now(), Sample::CaptivePortal { detected: false });
+        let cleared = s.apply_sample(c.tick(), Sample::CaptivePortal { detected: false });
         assert!(!s.captive_portal);
         assert_eq!(cleared.len(), 1);
         assert_eq!(cleared[0].severity, Health::Ok);
@@ -1608,10 +1734,11 @@ mod tests {
     #[test]
     fn public_ip_change_is_logged_but_first_sight_is_silent() {
         let mut s = AppState::new(test_config());
+        let mut c = Clock::new();
         // First observation just records the IP — no incident.
         assert!(
             s.apply_sample(
-                now(),
+                c.tick(),
                 Sample::PublicIp {
                     ip: "1.2.3.4".into()
                 }
@@ -1622,7 +1749,7 @@ mod tests {
         // Same IP again — still silent.
         assert!(
             s.apply_sample(
-                now(),
+                c.tick(),
                 Sample::PublicIp {
                     ip: "1.2.3.4".into()
                 }
@@ -1631,7 +1758,7 @@ mod tests {
         );
         // A change is logged (WAN flap / failover / CGNAT shuffle).
         let out = s.apply_sample(
-            now(),
+            c.tick(),
             Sample::PublicIp {
                 ip: "5.6.7.8".into(),
             },
@@ -1644,13 +1771,14 @@ mod tests {
     #[test]
     fn bufferbloat_over_threshold_warns() {
         let mut s = AppState::new(test_config()); // bufferbloat warn 100 / crit 300 ms
+        let mut c = Clock::new();
         // +150 ms under load → Warn once debounced.
         let sample = Sample::Bufferbloat {
             idle_ms: 20.0,
             loaded_ms: 170.0,
         };
-        s.apply_sample(now(), sample.clone());
-        let out = s.apply_sample(now(), sample);
+        s.apply_sample(c.tick(), sample.clone());
+        let out = s.apply_sample(c.tick(), sample);
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].severity, Health::Warn);
         assert_eq!(s.throughput.loaded_latency_ms, Some(170.0));
@@ -1659,13 +1787,14 @@ mod tests {
     #[test]
     fn bufferbloat_crit_reddens_the_throughput_panel() {
         let mut s = AppState::new(test_config()); // bufferbloat warn 100 / crit 300 ms
+        let mut c = Clock::new();
         // +380 ms under load → Crit once debounced.
         let sample = Sample::Bufferbloat {
             idle_ms: 20.0,
             loaded_ms: 400.0,
         };
-        s.apply_sample(now(), sample.clone());
-        let out = s.apply_sample(now(), sample);
+        s.apply_sample(c.tick(), sample.clone());
+        let out = s.apply_sample(c.tick(), sample);
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].severity, Health::Crit);
         // The incident is worthless if the panel it belongs to still looks healthy.
@@ -1688,8 +1817,9 @@ mod tests {
     #[test]
     fn throughput_passive_fills_series_without_incident() {
         let mut s = AppState::new(test_config());
+        let mut c = Clock::new();
         let out = s.apply_sample(
-            now(),
+            c.tick(),
             Sample::Throughput {
                 rx_bps: 1000.0,
                 tx_bps: 200.0,
@@ -1705,8 +1835,9 @@ mod tests {
         let mut c = test_config();
         c.thresholds.throughput = Thresholds::lower_is_worse(100.0, 25.0);
         let mut s = AppState::new(c);
-        s.apply_sample(now(), Sample::ThroughputProbe { mbps: 50.0 });
-        let out = s.apply_sample(now(), Sample::ThroughputProbe { mbps: 40.0 });
+        let mut c = Clock::new();
+        s.apply_sample(c.tick(), Sample::ThroughputProbe { mbps: 50.0 });
+        let out = s.apply_sample(c.tick(), Sample::ThroughputProbe { mbps: 40.0 });
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].severity, Health::Warn);
         assert_eq!(out[0].value, Some(40.0));
@@ -1719,9 +1850,10 @@ mod tests {
         let mut c = test_config();
         c.thresholds.throughput = Thresholds::lower_is_worse(100.0, 25.0);
         let mut s = AppState::new(c);
+        let mut c = Clock::new();
         // 4 Mbps on a link expected to do 100 is not a "warning", it is unusable.
-        s.apply_sample(now(), Sample::ThroughputProbe { mbps: 5.0 });
-        let out = s.apply_sample(now(), Sample::ThroughputProbe { mbps: 4.0 });
+        s.apply_sample(c.tick(), Sample::ThroughputProbe { mbps: 5.0 });
+        let out = s.apply_sample(c.tick(), Sample::ThroughputProbe { mbps: 4.0 });
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].severity, Health::Crit);
         assert_eq!(out[0].value, Some(4.0));
@@ -1733,8 +1865,9 @@ mod tests {
     #[test]
     fn link_weak_rssi_warns_and_keeps_ssid() {
         let mut s = AppState::new(test_config()); // rssi warn -70 / crit -80 (lower is worse)
+        let mut c = Clock::new();
         s.apply_sample(
-            now(),
+            c.tick(),
             Sample::Link {
                 rssi_dbm: Some(-75.0),
                 noise_dbm: None,
@@ -1743,7 +1876,7 @@ mod tests {
             },
         );
         let out = s.apply_sample(
-            now(),
+            c.tick(),
             Sample::Link {
                 rssi_dbm: Some(-76.0),
                 noise_dbm: None,
@@ -1761,6 +1894,7 @@ mod tests {
     #[test]
     fn routing_unreachable_is_crit() {
         let mut s = AppState::new(test_config());
+        let mut c = Clock::new();
         let r = Sample::Routing {
             target: "1.1.1.1".into(),
             hops: 0,
@@ -1768,8 +1902,8 @@ mod tests {
             changed: false,
             detail: vec![],
         };
-        s.apply_sample(now(), r.clone());
-        let out = s.apply_sample(now(), r);
+        s.apply_sample(c.tick(), r.clone());
+        let out = s.apply_sample(c.tick(), r);
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].severity, Health::Crit);
         assert_eq!(s.panel_health(MetricId::Routing), Health::Crit);
@@ -1778,8 +1912,9 @@ mod tests {
     #[test]
     fn routing_change_warns() {
         let mut s = AppState::new(test_config());
+        let mut c = Clock::new();
         s.apply_sample(
-            now(),
+            c.tick(),
             Sample::Routing {
                 target: "t".into(),
                 hops: 8,
@@ -1789,7 +1924,7 @@ mod tests {
             },
         );
         let out = s.apply_sample(
-            now(),
+            c.tick(),
             Sample::Routing {
                 target: "t".into(),
                 hops: 9,
@@ -1819,9 +1954,10 @@ mod tests {
     #[test]
     fn scroll_is_bounded_by_event_count() {
         let mut s = AppState::new(test_config());
+        let mut c = Clock::new();
         // Generate a few incidents (loss crit transitions).
         for _ in 0..3 {
-            s.apply_sample(now(), timeout("1.1.1.1"));
+            s.apply_sample(c.tick(), timeout("1.1.1.1"));
         }
         assert!(!s.events.is_empty());
         // Scroll far past the end — clamps to len-1, and never underflows.
@@ -1838,13 +1974,14 @@ mod tests {
     #[test]
     fn events_ring_is_capped() {
         let mut s = AppState::new(test_config());
+        let mut c = Clock::new();
         s.max_events = 3;
         for _ in 0..10 {
             // alternate crit/ok on loss to keep generating transitions
-            s.apply_sample(now(), timeout("1.1.1.1"));
-            s.apply_sample(now(), timeout("1.1.1.1"));
-            s.apply_sample(now(), latency("1.1.1.1", 5.0));
-            s.apply_sample(now(), latency("1.1.1.1", 5.0));
+            s.apply_sample(c.tick(), timeout("1.1.1.1"));
+            s.apply_sample(c.tick(), timeout("1.1.1.1"));
+            s.apply_sample(c.tick(), latency("1.1.1.1", 5.0));
+            s.apply_sample(c.tick(), latency("1.1.1.1", 5.0));
         }
         assert!(
             s.events.len() <= 3,

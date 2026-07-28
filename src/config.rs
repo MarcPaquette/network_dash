@@ -19,6 +19,11 @@ pub struct Config {
     pub thresholds: ThresholdConfig,
     pub throughput: ThroughputConfig,
     pub ui: UiConfig,
+    /// Deprecated keys found in the loaded file, for the caller to report. Not part of the
+    /// schema: it describes the file that was read, not a setting, so it neither
+    /// deserializes nor round-trips back out.
+    #[serde(skip)]
+    pub deprecated_keys: Vec<String>,
 }
 
 impl Default for Config {
@@ -30,6 +35,7 @@ impl Default for Config {
             thresholds: ThresholdConfig::default(),
             throughput: ThroughputConfig::default(),
             ui: UiConfig::default(),
+            deprecated_keys: Vec::new(),
         }
     }
 }
@@ -145,8 +151,17 @@ pub struct ThresholdConfig {
     pub bufferbloat: Thresholds,
     /// Measured link capacity in Mbps (lower is worse).
     pub throughput: Thresholds,
-    /// Consecutive samples required to commit a health change (debounce).
-    pub debounce_samples: usize,
+    /// How long a degradation must persist before it is reported, in seconds.
+    pub trip_after_secs: f64,
+    /// How long a recovery must hold before it is reported, in seconds. Longer than
+    /// `trip_after_secs` on purpose — see [`crate::health::Debouncer`].
+    pub clear_after_secs: f64,
+    /// **Deprecated** — superseded by `trip_after_secs`/`clear_after_secs`. Still accepted
+    /// so existing configs keep working, but it cannot be converted: a sample count means
+    /// a different duration on every probe (3 samples is 3s of ping and 45s of Wi-Fi
+    /// polling), so there is no honest number to migrate it to. Dropped on load.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub debounce_samples: Option<usize>,
     /// Number of ping outcomes retained for the loss window.
     pub loss_window: usize,
     /// Number of points retained per history series (chart width).
@@ -165,11 +180,32 @@ impl Default for ThresholdConfig {
             snr: Thresholds::lower_is_worse(20.0, 10.0),
             bufferbloat: Thresholds::higher_is_worse(100.0, 300.0),
             throughput: Thresholds::lower_is_worse(100.0, 25.0),
-            debounce_samples: 3,
+            trip_after_secs: 3.0,
+            clear_after_secs: 15.0,
+            debounce_samples: None,
             loss_window: 60,
             history_len: 120,
         }
     }
+}
+
+impl ThresholdConfig {
+    /// Dwell before a degradation is committed.
+    pub fn trip_after(&self) -> chrono::Duration {
+        secs_to_duration(self.trip_after_secs)
+    }
+
+    /// Dwell before a recovery is committed.
+    pub fn clear_after(&self) -> chrono::Duration {
+        secs_to_duration(self.clear_after_secs)
+    }
+}
+
+/// Seconds → `chrono::Duration` at millisecond resolution. Negative values clamp to zero:
+/// a "negative dwell" is a typo, and treating it as "commit immediately" is the reading
+/// that cannot surprise anyone.
+fn secs_to_duration(secs: f64) -> chrono::Duration {
+    chrono::Duration::milliseconds((secs.max(0.0) * 1000.0) as i64)
 }
 
 /// Throughput probe settings.
@@ -232,13 +268,25 @@ impl Config {
     /// drags `crit` underneath it — leaving the stock 25 Mbps crit in place would classify
     /// every merely-slow reading under a low floor as critical. An explicitly configured
     /// `thresholds.throughput` always wins.
+    ///
+    /// `thresholds.debounce_samples` is dropped rather than converted, and recorded in
+    /// [`Config::deprecated_keys`] so the caller can say so: silently ignoring a knob
+    /// someone set is how you get a bug report about debouncing that nobody can reproduce.
     fn migrate_deprecated(&mut self) {
         let stock = ThresholdConfig::default().throughput;
-        if let Some(floor) = self.throughput.floor_mbps.take()
-            && self.thresholds.throughput == stock
-        {
-            self.thresholds.throughput =
-                Thresholds::lower_is_worse(floor, stock.crit.min(floor / 4.0));
+        if let Some(floor) = self.throughput.floor_mbps.take() {
+            self.deprecated_keys
+                .push("throughput.floor_mbps (migrated into thresholds.throughput)".to_string());
+            if self.thresholds.throughput == stock {
+                self.thresholds.throughput =
+                    Thresholds::lower_is_worse(floor, stock.crit.min(floor / 4.0));
+            }
+        }
+        if self.thresholds.debounce_samples.take().is_some() {
+            self.deprecated_keys.push(
+                "thresholds.debounce_samples (ignored — use trip_after_secs / clear_after_secs)"
+                    .to_string(),
+            );
         }
     }
 
@@ -255,6 +303,19 @@ impl Config {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Config::default()),
             Err(e) => Err(ConfigError::Io(e)),
         }
+    }
+
+    /// One human-readable line per retired key found in `path`, ready for stderr.
+    ///
+    /// Reported rather than migrated-in-silence: a setting that stopped doing what its name
+    /// says is worse than one that is gone, and the only person who can fix the file is the
+    /// one who wrote it. Returns strings instead of printing so it stays testable and the
+    /// caller decides where they land.
+    pub fn deprecation_warnings(&self, path: &Path) -> Vec<String> {
+        self.deprecated_keys
+            .iter()
+            .map(|k| format!("warning: {} in {}", k, path.display()))
+            .collect()
     }
 
     /// Default on-disk config path (`<config_dir>/network_dash/config.toml`).
@@ -309,7 +370,15 @@ mod tests {
             Direction::HigherIsWorse
         );
         assert_eq!(c.thresholds.rssi.direction, Direction::LowerIsWorse);
-        assert!(c.thresholds.debounce_samples >= 1);
+        assert!(c.thresholds.trip_after_secs > 0.0);
+        assert!(
+            c.thresholds.clear_after_secs > c.thresholds.trip_after_secs,
+            "recovery must be slower to commit than a fault, or a flap reads as a fix"
+        );
+        assert_eq!(
+            c.thresholds.debounce_samples, None,
+            "the retired knob must not come back as a default"
+        );
         assert!(c.thresholds.loss_window > 0);
         assert!(c.thresholds.history_len > 0);
         assert!(!c.throughput.probe_url.is_empty());
@@ -360,6 +429,69 @@ mod tests {
         .unwrap();
         assert_eq!(c.thresholds.throughput.warn, 500.0);
         assert_eq!(c.thresholds.throughput.crit, 100.0);
+    }
+
+    #[test]
+    fn dwell_helpers_convert_seconds_to_durations() {
+        let c = Config::default();
+        assert_eq!(c.thresholds.trip_after(), chrono::Duration::seconds(3));
+        assert_eq!(c.thresholds.clear_after(), chrono::Duration::seconds(15));
+        // Sub-second dwells are expressible; a negative one is a typo, not a time machine.
+        let t = ThresholdConfig {
+            trip_after_secs: 0.25,
+            clear_after_secs: -5.0,
+            ..ThresholdConfig::default()
+        };
+        assert_eq!(t.trip_after(), chrono::Duration::milliseconds(250));
+        assert_eq!(t.clear_after(), chrono::Duration::zero());
+    }
+
+    #[test]
+    fn deprecated_debounce_samples_is_dropped_and_reported() {
+        let c = Config::from_toml_str("[thresholds]\ndebounce_samples = 5\n")
+            .expect("a retired knob must not reject the whole config");
+        assert_eq!(c.thresholds.debounce_samples, None, "must not round-trip");
+        assert_eq!(
+            c.thresholds.trip_after_secs,
+            Config::default().thresholds.trip_after_secs,
+            "there is no honest conversion from a sample count, so defaults stand"
+        );
+        assert!(
+            c.deprecated_keys
+                .iter()
+                .any(|k| k.contains("debounce_samples")),
+            "an ignored setting must be reported, not swallowed: {:?}",
+            c.deprecated_keys
+        );
+        assert!(
+            !c.to_toml_string().unwrap().contains("debounce_samples"),
+            "the retired key must not be written back out"
+        );
+    }
+
+    #[test]
+    fn deprecation_warnings_name_the_file_and_every_key() {
+        let c = Config::from_toml_str(
+            "[thresholds]\ndebounce_samples = 5\n\n[throughput]\nfloor_mbps = 40.0\n",
+        )
+        .unwrap();
+        let w = c.deprecation_warnings(Path::new("/etc/np.toml"));
+        assert_eq!(w.len(), 2, "one line per retired key: {w:?}");
+        for line in &w {
+            assert!(line.starts_with("warning: "), "{line}");
+            assert!(
+                line.contains("/etc/np.toml"),
+                "say which file to edit: {line}"
+            );
+        }
+        assert!(w.iter().any(|l| l.contains("debounce_samples")), "{w:?}");
+        assert!(w.iter().any(|l| l.contains("floor_mbps")), "{w:?}");
+    }
+
+    #[test]
+    fn a_config_with_nothing_retired_warns_about_nothing() {
+        let c = Config::from_toml_str("[thresholds]\nloss_window = 30\n").unwrap();
+        assert!(c.deprecation_warnings(Path::new("/etc/np.toml")).is_empty());
     }
 
     #[test]

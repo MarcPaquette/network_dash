@@ -1081,7 +1081,9 @@ mod tests {
         let mut c = Config::default();
         c.targets.internet = vec!["1.1.1.1".into()];
         c.targets.gateway = None;
-        c.thresholds.debounce_samples = 1;
+        // Frozen clock in the render tests: no dwell, so a fed sample is committed at once.
+        c.thresholds.trip_after_secs = 0.0;
+        c.thresholds.clear_after_secs = 0.0;
         c.thresholds.loss_window = 4;
         AppState::new(c)
     }
@@ -1416,7 +1418,9 @@ mod tests {
         c.targets.internet = vec!["1.1.1.1".into()];
         c.targets.gateway = Some("192.168.1.1".into());
         c.targets.gateway_auto = false;
-        c.thresholds.debounce_samples = 1;
+        // Frozen clock in the render tests: no dwell, so a fed sample is committed at once.
+        c.thresholds.trip_after_secs = 0.0;
+        c.thresholds.clear_after_secs = 0.0;
         let mut state = AppState::new(c);
         let now = Utc.with_ymd_and_hms(2026, 7, 22, 12, 0, 0).unwrap();
         for _ in 0..2 {
@@ -1927,7 +1931,9 @@ mod tests {
         let mut c = Config::default();
         c.targets.internet = vec!["1.1.1.1".into(), "8.8.8.8".into()];
         c.targets.gateway = Some("192.168.1.1".into());
-        c.thresholds.debounce_samples = 1;
+        // Frozen clock in the render tests: no dwell, so a fed sample is committed at once.
+        c.thresholds.trip_after_secs = 0.0;
+        c.thresholds.clear_after_secs = 0.0;
         c.thresholds.loss_window = 8;
         let mut s = AppState::new(c);
         let t0 = Utc.with_ymd_and_hms(2026, 7, 20, 14, 0, 0).unwrap();

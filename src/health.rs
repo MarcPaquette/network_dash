@@ -5,6 +5,7 @@
 //! bounds. The debounce/hysteresis state machine that smooths flapping is added in a
 //! later phase and builds on these types.
 
+use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
 
 /// Health state of a single metric, ordered `Ok < Warn < Crit` so the worst state of a
@@ -93,25 +94,35 @@ impl Thresholds {
 }
 
 /// Debounces a stream of raw [`Health`] classifications so the *reported* state only
-/// changes once a differing value has been seen for `threshold` consecutive samples.
+/// changes once a differing value has persisted for a minimum **duration**.
 ///
-/// This prevents a single spurious sample (one slow ping, one dropped packet) from
-/// flipping a panel red and logging a bogus incident. Recovery is debounced the same way.
+/// Time, not a sample count: a count means something different on every probe. Three
+/// consecutive samples is 3 seconds of ping but 45 seconds of Wi-Fi polling, so one knob
+/// could never mean the same thing twice. Wall-clock is also what an operator actually
+/// cares about — "it has been bad for ten seconds", not "for four readings".
+///
+/// The two dwells are asymmetric on purpose. Tripping is fast, because a fault you are
+/// slow to report is a fault you notice from a user complaint instead. Clearing is slow,
+/// because a link that dips healthy for a moment mid-flap is not fixed, and reporting it
+/// as recovered turns one incident into a stream of round trips.
 #[derive(Debug, Clone)]
 pub struct Debouncer {
     current: Health,
-    /// The differing state we are currently counting toward, with its run length.
-    pending: Option<(Health, usize)>,
-    threshold: usize,
+    /// The differing state we are waiting on, and when its run began.
+    pending: Option<(Health, DateTime<Utc>)>,
+    trip_after: Duration,
+    clear_after: Duration,
 }
 
 impl Debouncer {
-    /// Start in `initial`, requiring `threshold` (min 1) consecutive samples to switch.
-    pub fn new(initial: Health, threshold: usize) -> Self {
+    /// Start in `initial`, requiring a worse state to persist for `trip_after` and a
+    /// better one for `clear_after` before it is committed.
+    pub fn new(initial: Health, trip_after: Duration, clear_after: Duration) -> Self {
         Self {
             current: initial,
             pending: None,
-            threshold: threshold.max(1),
+            trip_after,
+            clear_after,
         }
     }
 
@@ -120,24 +131,41 @@ impl Debouncer {
         self.current
     }
 
-    /// Feed one raw classification. Returns `Some(new_state)` on a confirmed transition,
-    /// otherwise `None`.
-    pub fn update(&mut self, raw: Health) -> Option<Health> {
+    /// Feed one raw classification observed at `now`. Returns `Some(new_state)` on a
+    /// confirmed transition, otherwise `None`.
+    pub fn update(&mut self, now: DateTime<Utc>, raw: Health) -> Option<Health> {
         if raw == self.current {
             // Back to (or still at) the committed state: abandon any pending change.
             self.pending = None;
             return None;
         }
-        let count = match self.pending {
-            Some((p, c)) if p == raw => c + 1,
-            _ => 1,
+        let worsening = raw > self.current;
+        let since = match &mut self.pending {
+            // Still on the same side of the committed state — a fault that deepened, or a
+            // recovery that stalled part-way. The run began when the state first differed,
+            // so getting worse (or less bad) must not buy a fresh grace period.
+            Some((candidate, since)) if (*candidate > self.current) == worsening => {
+                *candidate = raw;
+                // A clock corrected backwards would otherwise strand `since` in the
+                // future, where no later sample could ever satisfy the dwell.
+                *since = (*since).min(now);
+                *since
+            }
+            _ => {
+                self.pending = Some((raw, now));
+                now
+            }
         };
-        if count >= self.threshold {
+        let dwell = if worsening {
+            self.trip_after
+        } else {
+            self.clear_after
+        };
+        if now.signed_duration_since(since) >= dwell {
             self.current = raw;
             self.pending = None;
             Some(raw)
         } else {
-            self.pending = Some((raw, count));
             None
         }
     }
@@ -200,78 +228,124 @@ mod tests {
     }
 
     use Health::{Crit, Ok as HOk, Warn};
+    use chrono::{Duration, TimeZone, Utc};
 
-    /// Feed a sequence, collecting the transition emitted at each step.
-    fn run(initial: Health, threshold: usize, seq: &[Health]) -> Vec<Option<Health>> {
-        let mut d = Debouncer::new(initial, threshold);
-        seq.iter().map(|&h| d.update(h)).collect()
+    fn t0() -> chrono::DateTime<Utc> {
+        Utc.with_ymd_and_hms(2026, 7, 20, 14, 0, 0).unwrap()
+    }
+
+    fn secs(n: i64) -> Duration {
+        Duration::seconds(n)
+    }
+
+    /// Feed `(offset_secs, raw)` pairs, collecting the transition emitted at each step.
+    fn run(
+        initial: Health,
+        trip: Duration,
+        clear: Duration,
+        seq: &[(i64, Health)],
+    ) -> Vec<Option<Health>> {
+        let mut d = Debouncer::new(initial, trip, clear);
+        seq.iter()
+            .map(|&(at, h)| d.update(t0() + secs(at), h))
+            .collect()
     }
 
     #[test]
     fn debouncer_starts_in_initial() {
-        let d = Debouncer::new(Warn, 3);
+        let d = Debouncer::new(Warn, secs(3), secs(15));
         assert_eq!(d.current(), Warn);
     }
 
     #[test]
-    fn debouncer_threshold_clamped_to_one() {
-        // threshold 0 behaves as 1: a single differing sample transitions immediately.
-        let out = run(HOk, 0, &[Crit]);
+    fn debouncer_zero_dwell_trips_on_the_first_differing_sample() {
+        let out = run(HOk, Duration::zero(), Duration::zero(), &[(0, Crit)]);
         assert_eq!(out, vec![Some(Crit)]);
     }
 
     #[test]
     fn debouncer_stable_stream_never_transitions() {
-        let out = run(HOk, 3, &[HOk, HOk, HOk]);
+        let out = run(HOk, secs(3), secs(15), &[(0, HOk), (5, HOk), (10, HOk)]);
         assert_eq!(out, vec![None, None, None]);
     }
 
     #[test]
     fn debouncer_single_blip_is_ignored() {
-        let mut d = Debouncer::new(HOk, 3);
-        assert_eq!(d.update(Crit), None);
-        assert_eq!(d.update(HOk), None);
+        let mut d = Debouncer::new(HOk, secs(3), secs(15));
+        assert_eq!(d.update(t0(), Crit), None);
+        assert_eq!(d.update(t0() + secs(1), HOk), None);
         assert_eq!(d.current(), HOk);
     }
 
     #[test]
-    fn debouncer_sustained_change_transitions_at_threshold() {
-        let out = run(HOk, 3, &[Crit, Crit, Crit]);
-        assert_eq!(out, vec![None, None, Some(Crit)]);
+    fn debouncer_trips_only_once_the_fault_has_persisted() {
+        // A fault seen for 2s is still inside the 3s dwell; the sample at 3s commits it.
+        let out = run(
+            HOk,
+            secs(3),
+            secs(15),
+            &[(0, Crit), (2, Crit), (3, Crit), (4, Crit)],
+        );
+        assert_eq!(out, vec![None, None, Some(Crit), None]);
     }
 
     #[test]
-    fn debouncer_threshold_one_transitions_immediately() {
-        let out = run(HOk, 1, &[Crit]);
-        assert_eq!(out, vec![Some(Crit)]);
+    fn debouncer_is_slower_to_clear_than_to_trip() {
+        // The asymmetry is the whole point: a flapping link that dips healthy for a few
+        // seconds must not be reported as recovered, or the log fills with round trips.
+        let out = run(
+            Crit,
+            secs(3),
+            secs(15),
+            &[(0, HOk), (5, HOk), (10, HOk), (15, HOk)],
+        );
+        assert_eq!(out, vec![None, None, None, Some(HOk)]);
     }
 
     #[test]
-    fn debouncer_changing_candidate_resets_the_count() {
-        // Two Warn then three Crit: only the Crit run of 3 should commit.
-        let out = run(HOk, 3, &[Warn, Warn, Crit, Crit, Crit]);
-        assert_eq!(out, vec![None, None, None, None, Some(Crit)]);
+    fn debouncer_partial_recovery_waits_the_clear_dwell_too() {
+        // Crit → Warn is an improvement, so it earns the slow path even though the metric
+        // is still unhealthy.
+        let out = run(Crit, secs(3), secs(15), &[(0, Warn), (5, Warn), (15, Warn)]);
+        assert_eq!(out, vec![None, None, Some(Warn)]);
+    }
+
+    #[test]
+    fn debouncer_escalation_does_not_restart_the_clock() {
+        // Warn at 0s then Crit at 3s: the fault has been present for the full dwell, and
+        // getting worse is no reason to hand it a fresh grace period.
+        let out = run(HOk, secs(3), secs(15), &[(0, Warn), (3, Crit)]);
+        assert_eq!(out, vec![None, Some(Crit)]);
     }
 
     #[test]
     fn debouncer_return_to_stable_clears_pending() {
-        // Crit,Crit then back to Ok resets; the next two Crit are not enough to commit.
-        let out = run(HOk, 3, &[Crit, Crit, HOk, Crit, Crit]);
+        // Crit for 2s, back to Ok, then Crit again: the clock restarts from the second run.
+        let out = run(
+            HOk,
+            secs(3),
+            secs(15),
+            &[(0, Crit), (2, Crit), (3, HOk), (4, Crit), (6, Crit)],
+        );
         assert_eq!(out, vec![None, None, None, None, None]);
     }
 
     #[test]
-    fn debouncer_recovery_is_debounced() {
-        let out = run(Crit, 2, &[HOk, HOk]);
-        assert_eq!(out, vec![None, Some(HOk)]);
+    fn debouncer_a_clock_that_steps_backwards_does_not_strand_a_pending_change() {
+        // NTP correcting a skewed clock mid-fault must not leave `pending` anchored in the
+        // future, where no later sample could ever satisfy the dwell.
+        let mut d = Debouncer::new(HOk, secs(3), secs(15));
+        assert_eq!(d.update(t0() + secs(600), Crit), None);
+        assert_eq!(d.update(t0(), Crit), None); // clock corrected backwards
+        assert_eq!(d.update(t0() + secs(3), Crit), Some(Crit));
     }
 
     #[test]
     fn debouncer_current_tracks_committed_state() {
-        let mut d = Debouncer::new(HOk, 2);
-        d.update(Crit);
+        let mut d = Debouncer::new(HOk, secs(3), secs(15));
+        d.update(t0(), Crit);
         assert_eq!(d.current(), HOk); // not yet committed
-        d.update(Crit);
-        assert_eq!(d.current(), Crit); // committed after 2
+        d.update(t0() + secs(3), Crit);
+        assert_eq!(d.current(), Crit);
     }
 }
