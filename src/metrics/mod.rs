@@ -16,6 +16,7 @@ pub mod proc;
 pub mod pubip;
 pub mod reachability;
 pub mod routing;
+pub mod tcp;
 pub mod throughput;
 
 /// Stable identifier for each dashboard section / metric family.
@@ -35,6 +36,9 @@ pub enum MetricId {
     /// Frames the local NIC failed to send or receive — a hardware fault, not a network one.
     InterfaceErrors,
     Reachability,
+    /// Time to complete a TCP handshake — reachability plus everything a real connection
+    /// waits on that ICMP never sees.
+    TcpHandshake,
     /// Web traffic is being intercepted and a sign-in is required.
     CaptivePortal,
     /// The WAN-side address changed — an event rather than a fault (see [`MetricId::label`]).
@@ -57,6 +61,7 @@ impl MetricId {
             MetricId::Bufferbloat => "bufferbloat",
             MetricId::InterfaceErrors => "interface errors",
             MetricId::Reachability => "reachability",
+            MetricId::TcpHandshake => "tcp",
             MetricId::CaptivePortal => "captive portal",
             MetricId::PublicIp => "public ip",
             MetricId::Link => "link",
@@ -84,6 +89,11 @@ pub enum Sample {
     Bufferbloat { idle_ms: f64, loaded_ms: f64 },
     /// Frames the local NIC failed to receive/transmit since the previous reading.
     InterfaceErrors { rx_errors: u64, tx_errors: u64 },
+    /// Time to complete a TCP handshake. `connect_ms == None` means the port never opened.
+    TcpHandshake {
+        endpoint: String,
+        connect_ms: Option<f64>,
+    },
     /// Reachability check for a named endpoint.
     Reachability { endpoint: String, ok: bool },
     /// Captive-portal detection result (a login page intercepting web traffic).

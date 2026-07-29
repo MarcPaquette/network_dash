@@ -111,6 +111,26 @@ pub struct ReachState {
     health: Debouncer,
 }
 
+/// Per-endpoint TCP handshake state.
+///
+/// Separate from [`ReachState`] even though both ask "does this endpoint answer": reachability
+/// is a yes/no over HTTP, this is a *timing* below it, and a handshake that succeeds slowly is
+/// exactly the case the boolean cannot express.
+#[derive(Debug, Clone)]
+pub struct TcpState {
+    pub connect_ms: Series,
+    /// Whether the last handshake completed at all.
+    pub last_ok: bool,
+    health: Debouncer,
+}
+
+impl TcpState {
+    /// Current debounced handshake health for this endpoint.
+    pub fn health_current(&self) -> Health {
+        self.health.current()
+    }
+}
+
 /// Throughput state: passive rx/tx history, the last capacity-probe result, and the last
 /// bufferbloat (latency idle-vs-loaded) reading.
 #[derive(Debug, Clone, Default)]
@@ -222,6 +242,8 @@ pub struct AppState {
     pub targets: BTreeMap<String, TargetState>,
     pub resolvers: BTreeMap<String, ResolverState>,
     pub reachability: BTreeMap<String, ReachState>,
+    /// Per-endpoint TCP handshake timings.
+    pub tcp: BTreeMap<String, TcpState>,
     pub throughput: ThroughputState,
     pub link: LinkState,
     /// Local NIC error counters — the only signal that points at your own hardware.
@@ -271,6 +293,7 @@ impl AppState {
             targets: BTreeMap::new(),
             resolvers: BTreeMap::new(),
             reachability: BTreeMap::new(),
+            tcp: BTreeMap::new(),
             throughput: ThroughputState::default(),
             link: LinkState::default(),
             iface: InterfaceState::default(),
@@ -322,6 +345,10 @@ impl AppState {
                 resolver,
                 latency_ms,
             } => self.apply_dns(now, &resolver, latency_ms),
+            Sample::TcpHandshake {
+                endpoint,
+                connect_ms,
+            } => self.apply_tcp_handshake(now, &endpoint, connect_ms),
             Sample::Reachability { endpoint, ok } => self.apply_reachability(now, &endpoint, ok),
             Sample::CaptivePortal { detected } => self.apply_captive(now, detected),
             Sample::PublicIp { ip } => self.apply_public_ip(now, ip),
@@ -475,7 +502,11 @@ impl AppState {
             // frames breaks the Wi-Fi link rather than the other way round.
             MetricId::InterfaceErrors => Some(Layer::Nic),
             MetricId::Link => Some(Layer::Wifi),
-            MetricId::Reachability
+            // Same layer as reachability: both are end-to-end checks against a remote
+            // service, and both are evidence for an ISP verdict rather than consequences
+            // of one.
+            MetricId::TcpHandshake
+            | MetricId::Reachability
             | MetricId::Routing
             | MetricId::Throughput
             | MetricId::Bufferbloat
@@ -695,6 +726,70 @@ impl AppState {
                 now,
                 MetricId::Dns,
                 resolver,
+                sev,
+                latest,
+                "ms",
+                &thr,
+            )],
+            None => Vec::new(),
+        }
+    }
+
+    fn apply_tcp_handshake(
+        &mut self,
+        now: DateTime<Utc>,
+        endpoint: &str,
+        connect_ms: Option<f64>,
+    ) -> Vec<Incident> {
+        let cfg = self.config.clone();
+        let thr = cfg.thresholds.tcp_handshake;
+        let state = self
+            .tcp
+            .entry(endpoint.to_string())
+            .or_insert_with(|| TcpState {
+                connect_ms: Series::new(cfg.thresholds.history_len),
+                last_ok: true,
+                health: Debouncer::new(
+                    Health::Ok,
+                    cfg.thresholds.trip_after(),
+                    cfg.thresholds.clear_after(),
+                ),
+            });
+        let raw = match connect_ms {
+            Some(ms) => {
+                state.connect_ms.push(ms);
+                state.last_ok = true;
+                thr.evaluate(ms)
+            }
+            None => {
+                // Deliberately nothing pushed: a refusal has no duration, and recording it as
+                // a zero would drag the rolling average down at exactly the moment the panel
+                // needs to look worse, not better.
+                state.last_ok = false;
+                Health::Crit
+            }
+        };
+        let last_ok = state.last_ok;
+        let latest = state.connect_ms.latest().unwrap_or(0.0);
+        match state.health.update(now, raw) {
+            Some(Health::Ok) => vec![status_incident(
+                now,
+                MetricId::TcpHandshake,
+                endpoint,
+                Health::Ok,
+                format!("tcp handshake recovered ({endpoint})"),
+            )],
+            Some(sev) if !last_ok => vec![status_incident(
+                now,
+                MetricId::TcpHandshake,
+                endpoint,
+                sev,
+                format!("tcp connect refused ({endpoint})"),
+            )],
+            Some(sev) => vec![incident_for(
+                now,
+                MetricId::TcpHandshake,
+                endpoint,
                 sev,
                 latest,
                 "ms",
@@ -1202,6 +1297,12 @@ impl AppState {
             // A new WAN address is news, not a fault: nothing is broken, so nothing goes
             // red. Same for the dashboard's own log — the network is fine, the disk isn't,
             // and the header badge is where that belongs.
+            // The transport panel stands alone: a handshake that is slow while ping is fine
+            // is the whole point of measuring it, and rolling it into another panel would
+            // hide exactly that case.
+            MetricId::TcpHandshake => {
+                Health::worst_of(self.tcp.values().map(TcpState::health_current))
+            }
             MetricId::PublicIp | MetricId::Log => Health::Ok,
         }
     }
@@ -1215,6 +1316,7 @@ impl AppState {
             self.panel_health(MetricId::Throughput),
             self.panel_health(MetricId::Routing),
             self.panel_health(MetricId::Link),
+            self.panel_health(MetricId::TcpHandshake),
         ])
     }
 }
@@ -2002,6 +2104,86 @@ mod tests {
         assert_eq!(cleared.len(), 1, "{cleared:#?}");
         assert_eq!(cleared[0].severity, Health::Ok);
         assert!(!s.captive_portal);
+    }
+
+    // --- tcp handshake ---
+
+    fn handshake(endpoint: &str, ms: Option<f64>) -> Sample {
+        Sample::TcpHandshake {
+            endpoint: endpoint.into(),
+            connect_ms: ms,
+        }
+    }
+
+    #[test]
+    fn a_fast_handshake_is_recorded_without_comment() {
+        let mut s = AppState::new(test_config());
+        let mut c = Clock::new();
+        let quiet = drive(&mut s, &mut c, 4, || handshake("cloudflare", Some(20.0)));
+        assert!(quiet.is_empty(), "{quiet:#?}");
+        let ep = s.tcp.get("cloudflare").expect("registered on first sample");
+        assert_eq!(ep.connect_ms.latest(), Some(20.0));
+        assert_eq!(s.panel_health(MetricId::TcpHandshake), Health::Ok);
+    }
+
+    #[test]
+    fn a_port_that_will_not_open_is_critical() {
+        let mut s = AppState::new(test_config());
+        let mut c = Clock::new();
+        let raised = drive(&mut s, &mut c, 2, || handshake("cloudflare", None));
+        assert_eq!(raised.len(), 1, "{raised:#?}");
+        assert_eq!(raised[0].metric, MetricId::TcpHandshake);
+        assert_eq!(raised[0].severity, Health::Crit);
+        assert_eq!(raised[0].target.as_deref(), Some("cloudflare"));
+        assert_eq!(s.panel_health(MetricId::TcpHandshake), Health::Crit);
+    }
+
+    #[test]
+    fn a_slow_handshake_warns_before_it_fails() {
+        let mut cfg = test_config();
+        cfg.thresholds.tcp_handshake = crate::health::Thresholds::higher_is_worse(100.0, 500.0);
+        let mut s = AppState::new(cfg);
+        let mut c = Clock::new();
+        let raised = drive(&mut s, &mut c, 2, || handshake("google", Some(220.0)));
+        assert_eq!(raised.len(), 1, "{raised:#?}");
+        assert_eq!(raised[0].severity, Health::Warn);
+        assert_eq!(raised[0].threshold, Some(100.0), "{:?}", raised[0]);
+    }
+
+    #[test]
+    fn one_bad_endpoint_does_not_condemn_the_others() {
+        let mut s = AppState::new(test_config());
+        let mut c = Clock::new();
+        for _ in 0..2 {
+            let t = c.tick();
+            s.apply_sample(t, handshake("cloudflare", Some(15.0)));
+            s.apply_sample(t, handshake("google", None));
+        }
+        assert_eq!(
+            s.tcp["cloudflare"].health_current(),
+            Health::Ok,
+            "a healthy endpoint stays healthy"
+        );
+        assert_eq!(
+            s.panel_health(MetricId::TcpHandshake),
+            Health::Crit,
+            "but the panel reports the worst of them"
+        );
+    }
+
+    #[test]
+    fn a_failed_handshake_records_no_timing() {
+        let mut s = AppState::new(test_config());
+        let mut c = Clock::new();
+        s.apply_sample(c.tick(), handshake("google", Some(30.0)));
+        s.apply_sample(c.tick(), handshake("google", None));
+        let ep = &s.tcp["google"];
+        assert_eq!(
+            ep.connect_ms.len(),
+            1,
+            "a refusal is not a zero-millisecond connection"
+        );
+        assert!(!ep.last_ok);
     }
 
     // --- interface errors ---

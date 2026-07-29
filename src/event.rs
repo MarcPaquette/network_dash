@@ -181,6 +181,14 @@ pub async fn run_once(config: Config) -> color_eyre::Result<()> {
     samples.extend(crate::metrics::link::WifiProbe.tick().await);
     samples.extend(crate::metrics::iface::InterfaceProbe::new().tick().await);
     samples.extend(
+        crate::metrics::tcp::TcpProbe::new(
+            crate::metrics::tcp::TcpProbe::default_endpoints(),
+            Duration::from_secs(3),
+        )
+        .tick()
+        .await,
+    );
+    samples.extend(
         crate::metrics::routing::RoutingProbe::new(
             config.targets.routing_target.clone(),
             config.targets.max_hops,
@@ -214,6 +222,7 @@ pub async fn run_once(config: Config) -> color_eyre::Result<()> {
         MetricId::Routing,
         MetricId::Throughput,
         MetricId::Link,
+        MetricId::TcpHandshake,
     ] {
         println!("  {:<16} {}", m.label(), badge(state.panel_health(m)));
     }
@@ -223,6 +232,14 @@ pub async fn run_once(config: Config) -> color_eyre::Result<()> {
             MetricId::InterfaceErrors.label(),
             badge(state.iface.health_current())
         );
+    }
+    for (name, ep) in &state.tcp {
+        let v = if ep.last_ok {
+            format!("{:.0}ms", ep.connect_ms.latest().unwrap_or(0.0))
+        } else {
+            "REFUSED".into()
+        };
+        println!("  tcp  {name:<16} {v}");
     }
     for (name, t) in &state.targets {
         println!(
@@ -313,6 +330,18 @@ async fn run_inner(terminal: &mut crate::tui::Tui, config: Config) -> color_eyre
     handles.push(spawn_probe(
         crate::metrics::iface::InterfaceProbe::new(),
         Duration::from_millis(config.cadence.interface_ms),
+        tx.clone(),
+        &wake,
+    ));
+
+    // TCP handshake timing: what a real connection waits on, which ICMP cannot see. Slow
+    // cadence — it opens a connection on someone else's host, so it stays occasional.
+    handles.push(spawn_probe(
+        crate::metrics::tcp::TcpProbe::new(
+            crate::metrics::tcp::TcpProbe::default_endpoints(),
+            Duration::from_secs(3),
+        ),
+        Duration::from_millis(config.cadence.tcp_ms),
         tx.clone(),
         &wake,
     ));

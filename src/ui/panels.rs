@@ -339,22 +339,43 @@ pub fn availability(frame: &mut Frame, area: Rect, state: &AppState) {
     frame.render_widget(Paragraph::new(line), inner);
 }
 
-/// Transport panel: TCP/TLS handshake timing and certificate expiry. The probes land in a
-/// later phase; the panel exists now so the layout is settled before data arrives.
+/// Transport panel: TCP handshake timing per endpoint, plus the TLS/cert row still to come.
+///
+/// One line for every endpoint on a single row rather than a line each, so the panel keeps
+/// its two-row slot in the detail band no matter how many endpoints are configured.
 pub fn transport(frame: &mut Frame, area: Rect, state: &AppState) {
-    let block = metric_block("TRANSPORT", Health::Ok, &state.theme);
+    let block = metric_block(
+        "TRANSPORT",
+        state.panel_health(MetricId::TcpHandshake),
+        &state.theme,
+    );
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
     let dim = Style::default().fg(state.theme.muted);
+    let mut tcp_row = vec![Span::raw("tcp  ")];
+    if state.tcp.is_empty() {
+        tcp_row.push(Span::styled("—", dim));
+    }
+    for (name, ep) in &state.tcp {
+        let style = Style::default().fg(state.theme.health_color(ep.health_current()));
+        // "refused" rather than the last good time: a stale number next to a live label reads
+        // as the current state, and here the current state is that nothing connected.
+        let reading = match (ep.last_ok, ep.connect_ms.latest()) {
+            (true, Some(ms)) => format!("{ms:.0}ms"),
+            (true, None) => "—".to_string(),
+            (false, _) => "refused".to_string(),
+        };
+        tcp_row.push(Span::styled(format!("{name} {reading}   "), style));
+    }
     let lines = vec![
+        Line::from(tcp_row),
         Line::from(vec![
-            Span::raw("tcp  "),
+            Span::raw("tls  "),
             Span::styled("—", dim),
-            Span::raw("    tls  "),
+            Span::raw("    cert "),
             Span::styled("—", dim),
         ]),
-        Line::from(vec![Span::raw("cert "), Span::styled("—", dim)]),
     ];
     frame.render_widget(Paragraph::new(lines), inner);
 }
@@ -1725,6 +1746,70 @@ mod tests {
         let text = buffer_text(&term);
         assert!(text.contains("err 7 rx"), "should show rx errors: {text}");
         assert!(text.contains("2 tx"), "should show tx errors: {text}");
+    }
+
+    /// Fold one handshake reading into a fresh state.
+    fn with_handshake(state: &mut AppState, endpoint: &str, connect_ms: Option<f64>) {
+        state.apply_sample(
+            Utc::now(),
+            Sample::TcpHandshake {
+                endpoint: endpoint.into(),
+                connect_ms,
+            },
+        );
+    }
+
+    #[test]
+    fn transport_panel_waits_for_data_rather_than_inventing_it() {
+        let state = test_state();
+        let mut term = Terminal::new(TestBackend::new(80, 4)).unwrap();
+        term.draw(|f| transport(f, f.area(), &state)).unwrap();
+        let text = buffer_text(&term);
+        assert!(text.contains("tcp"), "the row is always labelled: {text}");
+        assert!(
+            !text.contains("ms"),
+            "no probe has run, so there is no timing to show: {text}"
+        );
+    }
+
+    #[test]
+    fn transport_panel_times_every_endpoint() {
+        let mut state = test_state();
+        with_handshake(&mut state, "cloudflare", Some(12.0));
+        with_handshake(&mut state, "google", Some(31.0));
+        let mut term = Terminal::new(TestBackend::new(80, 4)).unwrap();
+        term.draw(|f| transport(f, f.area(), &state)).unwrap();
+        let text = buffer_text(&term);
+        assert!(text.contains("cloudflare 12ms"), "{text}");
+        assert!(text.contains("google 31ms"), "{text}");
+    }
+
+    #[test]
+    fn transport_panel_says_refused_rather_than_showing_a_stale_time() {
+        let mut state = test_state();
+        with_handshake(&mut state, "google", Some(31.0));
+        with_handshake(&mut state, "google", None);
+        let mut term = Terminal::new(TestBackend::new(80, 4)).unwrap();
+        term.draw(|f| transport(f, f.area(), &state)).unwrap();
+        let text = buffer_text(&term);
+        assert!(text.contains("google refused"), "{text}");
+        assert!(
+            !text.contains("31ms"),
+            "the last good time is not the current state: {text}"
+        );
+    }
+
+    #[test]
+    fn a_refused_handshake_reddens_the_transport_border() {
+        let mut state = test_state();
+        with_handshake(&mut state, "google", None);
+        let mut term = Terminal::new(TestBackend::new(80, 4)).unwrap();
+        term.draw(|f| transport(f, f.area(), &state)).unwrap();
+        assert_eq!(
+            term.backend().buffer()[(0, 0)].fg,
+            state.theme.crit,
+            "the core visual contract: a broken transport shows on the border"
+        );
     }
 
     #[test]
