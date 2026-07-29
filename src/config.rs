@@ -440,8 +440,54 @@ impl std::error::Error for ConfigError {}
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::health::Direction;
+    use crate::health::{Direction, Health};
     use pretty_assertions::assert_eq;
+    use rstest::rstest;
+
+    /// The shipped threshold numbers, checked against readings a real network produces.
+    ///
+    /// These are the *calibration*, and nothing else in the suite tests them: every other
+    /// threshold test builds its own `Thresholds` so it can control the boundary. A default
+    /// that cries wolf is the specific failure the debouncer cannot save you from — it fires
+    /// consistently, so it trips every dwell — and the only way to notice is to write down
+    /// what a healthy network actually looks like.
+    #[rstest]
+    // A handshake to an anycast resolver, and one across an ocean. Both normal.
+    #[case::tcp_local("tcp_handshake", 15.0, Health::Ok)]
+    #[case::tcp_transatlantic("tcp_handshake", 180.0, Health::Ok)]
+    #[case::tcp_struggling("tcp_handshake", 400.0, Health::Warn)]
+    #[case::tcp_hopeless("tcp_handshake", 2500.0, Health::Crit)]
+    // TLS is a second round trip plus key exchange on top of the handshake above, so the
+    // limits are looser: 300ms of real crypto is not a fault.
+    #[case::tls_local("tls_handshake", 60.0, Health::Ok)]
+    #[case::tls_distant("tls_handshake", 300.0, Health::Ok)]
+    #[case::tls_slow("tls_handshake", 600.0, Health::Warn)]
+    #[case::tls_hopeless("tls_handshake", 3000.0, Health::Crit)]
+    // A 90-day certificate at issue, and Let's Encrypt's own renewal window at 30 days —
+    // both must be silent, or the warning means nothing by the time it matters.
+    #[case::cert_fresh("cert_expiry_days", 90.0, Health::Ok)]
+    #[case::cert_renewal_window("cert_expiry_days", 30.0, Health::Ok)]
+    #[case::cert_overdue("cert_expiry_days", 10.0, Health::Warn)]
+    #[case::cert_imminent("cert_expiry_days", 2.0, Health::Crit)]
+    #[case::cert_expired("cert_expiry_days", -1.0, Health::Crit)]
+    // A clean NIC reports exactly zero, so any error at all is worth a word.
+    #[case::nic_clean("interface_errors", 0.0, Health::Ok)]
+    #[case::nic_one_frame("interface_errors", 1.0, Health::Warn)]
+    fn the_shipped_thresholds_agree_with_a_real_network(
+        #[case] name: &str,
+        #[case] reading: f64,
+        #[case] expected: Health,
+    ) {
+        let t = Config::default().thresholds;
+        let thr = match name {
+            "tcp_handshake" => t.tcp_handshake,
+            "tls_handshake" => t.tls_handshake,
+            "cert_expiry_days" => t.cert_expiry_days,
+            "interface_errors" => t.interface_errors,
+            other => panic!("unknown threshold {other}"),
+        };
+        assert_eq!(thr.evaluate(reading), expected, "{name} at {reading}");
+    }
 
     #[test]
     fn defaults_are_complete_and_sane() {

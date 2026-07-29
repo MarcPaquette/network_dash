@@ -2712,6 +2712,52 @@ mod tests {
         );
     }
 
+    /// Everything the reducer can emit must survive the trip to disk and back.
+    ///
+    /// The log is the only record that outlives the process, and a new `MetricId` that fails
+    /// to serialize — or a field silently dropped by `to_jsonl_line` — would be invisible
+    /// until someone went looking for an incident that was never written properly. The sink
+    /// is injected, so this runs in the fast suite without touching the filesystem.
+    #[test]
+    fn every_incident_the_reducer_raises_survives_the_log_round_trip() {
+        let mut s = AppState::new(test_config());
+        let mut c = Clock::new();
+        let faults: Vec<Sample> = vec![
+            handshake("cloudflare", None),
+            tls("cloudflare", None, None),
+            tls("google", Some(20.0), Some(-2)),
+            integrity("system", true),
+            Sample::Reachability {
+                endpoint: "https".into(),
+                ok: false,
+            },
+            errors(40, 0),
+        ];
+        let mut raised = Vec::new();
+        for _ in 0..3 {
+            let t = c.tick();
+            for f in &faults {
+                raised.extend(s.apply_sample(t, f.clone()));
+            }
+        }
+        assert!(raised.len() >= faults.len(), "{raised:#?}");
+
+        let mut log = crate::incidents::IncidentLog::new(Vec::new());
+        for inc in &raised {
+            log.append(inc).expect("a Vec sink cannot fail");
+        }
+        let bytes = log.into_inner();
+        let text = String::from_utf8(bytes).expect("JSONL is utf-8");
+        let parsed: Vec<Incident> = text
+            .lines()
+            .map(|l| Incident::from_jsonl_line(l).unwrap_or_else(|e| panic!("{l}: {e}")))
+            .collect();
+        assert_eq!(
+            parsed, raised,
+            "an incident changed shape on the way to disk"
+        );
+    }
+
     // --- interface errors ---
 
     fn errors(rx: u64, tx: u64) -> Sample {
