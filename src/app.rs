@@ -182,6 +182,47 @@ impl TcpState {
     }
 }
 
+/// Per-endpoint TLS state: how long negotiation takes, and how long the certificate has
+/// left.
+///
+/// The two live together because one handshake produces both, but they are judged apart:
+/// a certificate three days from expiry is not slow, is not down, and would be invisible
+/// to any timing threshold right up until the morning it takes the site off the air.
+#[derive(Debug, Clone)]
+pub struct TlsState {
+    pub handshake_ms: Series,
+    /// Days of validity left on the leaf certificate, negative once it has expired.
+    /// Retained across a failed handshake — no reading is not the same as no time left.
+    pub expires_in_days: Option<i64>,
+    /// Whether the last negotiation completed at all.
+    pub last_ok: bool,
+    health: Debouncer,
+    expiry_health: Debouncer,
+}
+
+impl TlsState {
+    fn new(cfg: &Config) -> Self {
+        let (trip, clear) = (cfg.thresholds.trip_after(), cfg.thresholds.clear_after());
+        Self {
+            handshake_ms: Series::new(cfg.thresholds.history_len),
+            expires_in_days: None,
+            last_ok: true,
+            health: Debouncer::new(Health::Ok, trip, clear),
+            expiry_health: Debouncer::new(Health::Ok, trip, clear),
+        }
+    }
+
+    /// Current debounced negotiation-timing health for this endpoint.
+    pub fn health_current(&self) -> Health {
+        self.health.current()
+    }
+
+    /// Current debounced certificate-expiry health for this endpoint.
+    pub fn expiry_health_current(&self) -> Health {
+        self.expiry_health.current()
+    }
+}
+
 /// Throughput state: passive rx/tx history, the last capacity-probe result, and the last
 /// bufferbloat (latency idle-vs-loaded) reading.
 #[derive(Debug, Clone, Default)]
@@ -295,6 +336,8 @@ pub struct AppState {
     pub reachability: BTreeMap<String, ReachState>,
     /// Per-endpoint TCP handshake timings.
     pub tcp: BTreeMap<String, TcpState>,
+    /// Per-endpoint TLS negotiation timing and certificate expiry.
+    pub tls: BTreeMap<String, TlsState>,
     pub throughput: ThroughputState,
     pub link: LinkState,
     /// Local NIC error counters — the only signal that points at your own hardware.
@@ -345,6 +388,7 @@ impl AppState {
             resolvers: BTreeMap::new(),
             reachability: BTreeMap::new(),
             tcp: BTreeMap::new(),
+            tls: BTreeMap::new(),
             throughput: ThroughputState::default(),
             link: LinkState::default(),
             iface: InterfaceState::default(),
@@ -414,6 +458,11 @@ impl AppState {
                 endpoint,
                 connect_ms,
             } => self.apply_tcp_handshake(now, &endpoint, connect_ms),
+            Sample::Tls {
+                endpoint,
+                handshake_ms,
+                expires_in_days,
+            } => self.apply_tls(now, &endpoint, handshake_ms, expires_in_days),
             Sample::Reachability { endpoint, ok } => self.apply_reachability(now, &endpoint, ok),
             Sample::CaptivePortal { detected } => self.apply_captive(now, detected),
             Sample::PublicIp { ip } => self.apply_public_ip(now, ip),
@@ -571,6 +620,7 @@ impl AppState {
             // service, and both are evidence for an ISP verdict rather than consequences
             // of one.
             MetricId::TcpHandshake
+            | MetricId::TlsHandshake
             | MetricId::Reachability
             | MetricId::Routing
             | MetricId::Throughput
@@ -580,6 +630,10 @@ impl AppState {
             | MetricId::CaptivePortal
             | MetricId::PublicIp => Some(Layer::Isp),
             MetricId::Dns => Some(Layer::Dns),
+            // A certificate running out is not a fault anywhere on the path — every layer
+            // is working perfectly and the date is still coming. Correlating it would let
+            // an unrelated ISP verdict dim the one warning nothing else will repeat.
+            MetricId::CertExpiry => None,
             // The dashboard complaining about its own log has no place on the network.
             MetricId::Log => None,
         }
@@ -852,6 +906,132 @@ impl AppState {
                 "ms",
                 &thr,
             )],
+            None => Vec::new(),
+        }
+    }
+
+    /// Fold one TLS reading: negotiation time and certificate expiry, judged separately.
+    ///
+    /// Two debouncers because they are two faults with two fixes — a slow handshake is the
+    /// network's problem and an expiring certificate is the operator's — and folding them
+    /// would let a fast negotiation vouch for a certificate that is about to expire.
+    fn apply_tls(
+        &mut self,
+        now: DateTime<Utc>,
+        endpoint: &str,
+        handshake_ms: Option<f64>,
+        expires_in_days: Option<i64>,
+    ) -> Vec<Incident> {
+        let cfg = self.config.clone();
+        let state = self
+            .tls
+            .entry(endpoint.to_string())
+            .or_insert_with(|| TlsState::new(&cfg));
+        let raw = match handshake_ms {
+            Some(ms) => {
+                state.handshake_ms.push(ms);
+                state.last_ok = true;
+                cfg.thresholds.tls_handshake.evaluate(ms)
+            }
+            None => {
+                // As with TCP: a negotiation that never finished has no duration, and a zero
+                // would flatter the average precisely when the panel should look worse.
+                state.last_ok = false;
+                Health::Crit
+            }
+        };
+        // Only advance the expiry verdict when there is a reading. A failed handshake says
+        // nothing about the date on the certificate, and feeding it `Ok` would quietly
+        // retract a warning that is still true.
+        if let Some(days) = expires_in_days {
+            state.expires_in_days = Some(days);
+        }
+        let mut out = self.tls_timing_incident(now, endpoint, raw);
+        if let Some(days) = expires_in_days {
+            out.extend(self.tls_expiry_incident(now, endpoint, days));
+        }
+        out
+    }
+
+    fn tls_timing_incident(
+        &mut self,
+        now: DateTime<Utc>,
+        endpoint: &str,
+        raw: Health,
+    ) -> Vec<Incident> {
+        let thr = self.config.thresholds.tls_handshake;
+        let Some(state) = self.tls.get_mut(endpoint) else {
+            return Vec::new();
+        };
+        let last_ok = state.last_ok;
+        let latest = state.handshake_ms.latest().unwrap_or(0.0);
+        match state.health.update(now, raw) {
+            Some(Health::Ok) => vec![status_incident(
+                now,
+                MetricId::TlsHandshake,
+                endpoint,
+                Health::Ok,
+                format!("tls handshake recovered ({endpoint})"),
+            )],
+            Some(sev) if !last_ok => vec![status_incident(
+                now,
+                MetricId::TlsHandshake,
+                endpoint,
+                sev,
+                format!("tls handshake failed ({endpoint})"),
+            )],
+            Some(sev) => vec![incident_for(
+                now,
+                MetricId::TlsHandshake,
+                endpoint,
+                sev,
+                latest,
+                "ms",
+                &thr,
+            )],
+            None => Vec::new(),
+        }
+    }
+
+    fn tls_expiry_incident(
+        &mut self,
+        now: DateTime<Utc>,
+        endpoint: &str,
+        days: i64,
+    ) -> Vec<Incident> {
+        let thr = self.config.thresholds.cert_expiry_days;
+        let Some(state) = self.tls.get_mut(endpoint) else {
+            return Vec::new();
+        };
+        let raw = thr.evaluate(days as f64);
+        match state.expiry_health.update(now, raw) {
+            Some(Health::Ok) => vec![status_incident(
+                now,
+                MetricId::CertExpiry,
+                endpoint,
+                Health::Ok,
+                format!("certificate renewed, {days}d left ({endpoint})"),
+            )],
+            // Spelled out rather than left to `incident_for`, which would render an expired
+            // certificate as "cert expiry -2d" — a number nobody should have to decode.
+            Some(sev) => {
+                let message = if days < 0 {
+                    format!("certificate expired {}d ago ({endpoint})", -days)
+                } else {
+                    format!("certificate expires in {days}d ({endpoint})")
+                };
+                let threshold = if sev == Health::Crit {
+                    thr.crit
+                } else {
+                    thr.warn
+                };
+                vec![
+                    Incident::new(now, MetricId::CertExpiry, sev, message)
+                        .with_value(days as f64, "d")
+                        .with_target(endpoint)
+                        .with_threshold(threshold),
+                ]
+            }
             None => Vec::new(),
         }
     }
@@ -1402,8 +1582,16 @@ impl AppState {
             // The transport panel stands alone: a handshake that is slow while ping is fine
             // is the whole point of measuring it, and rolling it into another panel would
             // hide exactly that case.
-            MetricId::TcpHandshake => {
-                Health::worst_of(self.tcp.values().map(TcpState::health_current))
+            MetricId::TcpHandshake | MetricId::TlsHandshake | MetricId::CertExpiry => {
+                let tcp = Health::worst_of(self.tcp.values().map(TcpState::health_current));
+                // Negotiation timing and expiry are separate faults on separate debouncers,
+                // but they are drawn on one border, so it shows the worse.
+                let tls = Health::worst_of(
+                    self.tls
+                        .values()
+                        .map(|t| t.health_current().worst(t.expiry_health_current())),
+                );
+                tcp.worst(tls)
             }
             MetricId::PublicIp | MetricId::Log => Health::Ok,
         }
@@ -2390,6 +2578,138 @@ mod tests {
             "a refusal is not a zero-millisecond connection"
         );
         assert!(!ep.last_ok);
+    }
+
+    // --- tls handshake & certificate expiry ---
+
+    fn tls(endpoint: &str, ms: Option<f64>, days: Option<i64>) -> Sample {
+        Sample::Tls {
+            endpoint: endpoint.into(),
+            handshake_ms: ms,
+            expires_in_days: days,
+        }
+    }
+
+    #[test]
+    fn a_fast_handshake_and_a_distant_expiry_are_recorded_without_comment() {
+        let mut s = AppState::new(test_config());
+        let mut c = Clock::new();
+        let quiet = drive(&mut s, &mut c, 4, || {
+            tls("cloudflare", Some(40.0), Some(90))
+        });
+        assert!(quiet.is_empty(), "{quiet:#?}");
+        let ep = s.tls.get("cloudflare").expect("registered on first sample");
+        assert_eq!(ep.handshake_ms.latest(), Some(40.0));
+        assert_eq!(ep.expires_in_days, Some(90));
+        assert_eq!(s.panel_health(MetricId::TlsHandshake), Health::Ok);
+    }
+
+    #[test]
+    fn a_handshake_that_never_completes_is_critical() {
+        let mut s = AppState::new(test_config());
+        let mut c = Clock::new();
+        let raised = drive(&mut s, &mut c, 2, || tls("cloudflare", None, None));
+        assert_eq!(raised.len(), 1, "{raised:#?}");
+        assert_eq!(raised[0].metric, MetricId::TlsHandshake);
+        assert_eq!(raised[0].severity, Health::Crit);
+        assert_eq!(raised[0].target.as_deref(), Some("cloudflare"));
+    }
+
+    #[test]
+    fn a_failed_negotiation_records_no_timing() {
+        let mut s = AppState::new(test_config());
+        let mut c = Clock::new();
+        s.apply_sample(c.tick(), tls("google", Some(50.0), Some(60)));
+        s.apply_sample(c.tick(), tls("google", None, None));
+        let ep = &s.tls["google"];
+        assert_eq!(
+            ep.handshake_ms.len(),
+            1,
+            "a failed negotiation is not a zero-millisecond one"
+        );
+        assert!(!ep.last_ok);
+    }
+
+    #[test]
+    fn a_failed_handshake_does_not_erase_what_the_certificate_last_said() {
+        let mut s = AppState::new(test_config());
+        let mut c = Clock::new();
+        s.apply_sample(c.tick(), tls("google", Some(50.0), Some(60)));
+        s.apply_sample(c.tick(), tls("google", None, None));
+        assert_eq!(
+            s.tls["google"].expires_in_days,
+            Some(60),
+            "no reading is not the same as no time left"
+        );
+    }
+
+    #[test]
+    fn a_certificate_running_out_warns_while_the_handshake_is_fine() {
+        let mut s = AppState::new(test_config());
+        let mut c = Clock::new();
+        let raised = drive(&mut s, &mut c, 2, || tls("google", Some(40.0), Some(9)));
+        assert_eq!(raised.len(), 1, "{raised:#?}");
+        assert_eq!(raised[0].metric, MetricId::CertExpiry);
+        assert_eq!(raised[0].severity, Health::Warn);
+        assert_eq!(
+            s.tls["google"].health_current(),
+            Health::Ok,
+            "the negotiation itself is quick; it is the paperwork that is running out"
+        );
+    }
+
+    #[test]
+    fn an_expired_certificate_is_critical() {
+        let mut s = AppState::new(test_config());
+        let mut c = Clock::new();
+        let raised = drive(&mut s, &mut c, 2, || tls("google", Some(40.0), Some(-2)));
+        assert_eq!(raised.len(), 1, "{raised:#?}");
+        assert_eq!(raised[0].metric, MetricId::CertExpiry);
+        assert_eq!(raised[0].severity, Health::Crit);
+    }
+
+    #[test]
+    fn a_slow_negotiation_warns_before_it_fails() {
+        let mut cfg = test_config();
+        cfg.thresholds.tls_handshake = crate::health::Thresholds::higher_is_worse(100.0, 500.0);
+        let mut s = AppState::new(cfg);
+        let mut c = Clock::new();
+        let raised = drive(&mut s, &mut c, 2, || tls("google", Some(240.0), Some(90)));
+        assert_eq!(raised.len(), 1, "{raised:#?}");
+        assert_eq!(raised[0].metric, MetricId::TlsHandshake);
+        assert_eq!(raised[0].severity, Health::Warn);
+        assert_eq!(raised[0].threshold, Some(100.0), "{:?}", raised[0]);
+    }
+
+    #[test]
+    fn the_transport_panel_reports_the_worst_of_tcp_and_tls() {
+        let mut s = AppState::new(test_config());
+        let mut c = Clock::new();
+        for _ in 0..2 {
+            let t = c.tick();
+            s.apply_sample(t, handshake("google", Some(15.0)));
+            s.apply_sample(t, tls("google", None, None));
+        }
+        assert_eq!(
+            s.panel_health(MetricId::TcpHandshake),
+            Health::Crit,
+            "the connection opens, so only TLS can explain this — but it is one panel"
+        );
+        assert_eq!(s.panel_health(MetricId::TlsHandshake), Health::Crit);
+        assert_eq!(s.overall_health(), Health::Crit);
+    }
+
+    #[test]
+    fn an_expiring_certificate_is_not_blamed_on_the_network() {
+        let mut s = AppState::new(test_config());
+        let mut c = Clock::new();
+        let raised = drive(&mut s, &mut c, 2, || tls("google", Some(40.0), Some(1)));
+        assert_eq!(raised.len(), 1, "{raised:#?}");
+        assert_eq!(
+            s.incident_layer(&raised[0]),
+            None,
+            "nothing on the path is broken; an ISP verdict must not dim this"
+        );
     }
 
     // --- interface errors ---

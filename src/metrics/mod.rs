@@ -18,6 +18,7 @@ pub mod reachability;
 pub mod routing;
 pub mod tcp;
 pub mod throughput;
+pub mod tls;
 
 /// Stable identifier for each dashboard section / metric family.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -39,6 +40,11 @@ pub enum MetricId {
     /// Time to complete a TCP handshake — reachability plus everything a real connection
     /// waits on that ICMP never sees.
     TcpHandshake,
+    /// Time to negotiate TLS on top of an open connection.
+    TlsHandshake,
+    /// How long the presented certificate has left. Not a network fault at all — nothing is
+    /// slow and nothing is down — but on a known date everything stops.
+    CertExpiry,
     /// Web traffic is being intercepted and a sign-in is required.
     CaptivePortal,
     /// The WAN-side address changed — an event rather than a fault (see [`MetricId::label`]).
@@ -62,6 +68,8 @@ impl MetricId {
             MetricId::InterfaceErrors => "interface errors",
             MetricId::Reachability => "reachability",
             MetricId::TcpHandshake => "tcp",
+            MetricId::TlsHandshake => "tls",
+            MetricId::CertExpiry => "cert expiry",
             MetricId::CaptivePortal => "captive portal",
             MetricId::PublicIp => "public ip",
             MetricId::Link => "link",
@@ -95,6 +103,13 @@ pub enum Sample {
     TcpHandshake {
         endpoint: String,
         connect_ms: Option<f64>,
+    },
+    /// TLS negotiation time and how long the presented certificate has left. Either is
+    /// `None` when the handshake did not complete — which is itself the finding.
+    Tls {
+        endpoint: String,
+        handshake_ms: Option<f64>,
+        expires_in_days: Option<i64>,
     },
     /// Reachability check for a named endpoint.
     Reachability { endpoint: String, ok: bool },

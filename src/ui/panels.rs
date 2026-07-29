@@ -368,15 +368,29 @@ pub fn transport(frame: &mut Frame, area: Rect, state: &AppState) {
         };
         tcp_row.push(Span::styled(format!("{name} {reading}   "), style));
     }
-    let lines = vec![
-        Line::from(tcp_row),
-        Line::from(vec![
-            Span::raw("tls  "),
-            Span::styled("—", dim),
-            Span::raw("    cert "),
-            Span::styled("—", dim),
-        ]),
-    ];
+    // Negotiation time and days-left sit side by side per endpoint but keep their own
+    // colours: the pair is produced by one handshake and judged by two thresholds.
+    let mut tls_row = vec![Span::raw("tls  ")];
+    if state.tls.is_empty() {
+        tls_row.push(Span::styled("—", dim));
+    }
+    for (name, ep) in &state.tls {
+        let style = Style::default().fg(state.theme.health_color(ep.health_current()));
+        let reading = match (ep.last_ok, ep.handshake_ms.latest()) {
+            (true, Some(ms)) => format!("{ms:.0}ms"),
+            (true, None) => "—".to_string(),
+            (false, _) => "failed".to_string(),
+        };
+        tls_row.push(Span::styled(format!("{name} {reading} "), style));
+        let expiry = Style::default().fg(state.theme.health_color(ep.expiry_health_current()));
+        match ep.expires_in_days {
+            // Negative days spelled out: "-2d left" is a puzzle, "expired" is not.
+            Some(d) if d < 0 => tls_row.push(Span::styled("expired   ".to_string(), expiry)),
+            Some(d) => tls_row.push(Span::styled(format!("{d}d   "), expiry)),
+            None => tls_row.push(Span::styled("—   ", dim)),
+        }
+    }
+    let lines = vec![Line::from(tcp_row), Line::from(tls_row)];
     frame.render_widget(Paragraph::new(lines), inner);
 }
 
@@ -1887,6 +1901,60 @@ mod tests {
             term.backend().buffer()[(0, 0)].fg,
             state.theme.crit,
             "the core visual contract: a broken transport shows on the border"
+        );
+    }
+
+    fn with_tls(state: &mut AppState, endpoint: &str, ms: Option<f64>, days: Option<i64>) {
+        state.apply_sample(
+            Utc::now(),
+            Sample::Tls {
+                endpoint: endpoint.into(),
+                handshake_ms: ms,
+                expires_in_days: days,
+            },
+        );
+    }
+
+    #[test]
+    fn transport_panel_shows_negotiation_time_and_days_left() {
+        let mut state = test_state();
+        with_tls(&mut state, "cloudflare", Some(48.0), Some(63));
+        let mut term = Terminal::new(TestBackend::new(80, 4)).unwrap();
+        term.draw(|f| transport(f, f.area(), &state)).unwrap();
+        let text = buffer_text(&term);
+        assert!(text.contains("cloudflare 48ms"), "{text}");
+        assert!(
+            text.contains("63d"),
+            "the cert row says how long is left: {text}"
+        );
+    }
+
+    #[test]
+    fn transport_panel_says_failed_rather_than_showing_a_stale_negotiation() {
+        let mut state = test_state();
+        with_tls(&mut state, "google", Some(48.0), Some(63));
+        with_tls(&mut state, "google", None, None);
+        let mut term = Terminal::new(TestBackend::new(80, 4)).unwrap();
+        term.draw(|f| transport(f, f.area(), &state)).unwrap();
+        let text = buffer_text(&term);
+        assert!(text.contains("google failed"), "{text}");
+        assert!(
+            !text.contains("48ms"),
+            "the last good negotiation is not the current state: {text}"
+        );
+    }
+
+    #[test]
+    fn an_expiring_certificate_reddens_the_transport_border() {
+        let mut state = test_state();
+        // Fast negotiation, nearly-dead certificate: nothing a timing threshold can see.
+        with_tls(&mut state, "google", Some(20.0), Some(1));
+        let mut term = Terminal::new(TestBackend::new(80, 4)).unwrap();
+        term.draw(|f| transport(f, f.area(), &state)).unwrap();
+        assert_eq!(
+            term.backend().buffer()[(0, 0)].fg,
+            state.theme.crit,
+            "one day left is a crit, and the border is where it has to show"
         );
     }
 

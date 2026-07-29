@@ -125,6 +125,10 @@ pub struct Cadence {
     /// TCP handshake timing. Slower than ping: it opens a real connection on a remote host,
     /// and there is no reason to do that every second.
     pub tcp_ms: u64,
+    /// TLS handshakes and certificate reads. Slower still than `tcp_ms`: a negotiation is
+    /// real work for the far end, and an expiry date measured in days does not need to be
+    /// re-read every minute.
+    pub tls_ms: u64,
     /// NIC error counters. Cheap enough to poll often — it is a counter read, not a probe —
     /// but errors are counted per interval, so a short one makes every burst look small.
     pub interface_ms: u64,
@@ -144,6 +148,7 @@ impl Default for Cadence {
             reachability_ms: 15_000,
             link_ms: 15_000,
             tcp_ms: 20_000,
+            tls_ms: 120_000,
             interface_ms: 10_000,
             public_ip_ms: 300_000,
             render_ms: 200,
@@ -180,6 +185,14 @@ pub struct ThresholdConfig {
     /// purpose: a handshake is a full round trip plus the far end's accept queue, so it is
     /// legitimately slower than ICMP to the same host and would cry wolf at ping's limits.
     pub tcp_handshake: Thresholds,
+    /// TLS negotiation time in ms (higher is worse). Looser again than `tcp_handshake`:
+    /// the handshake it sits on top of is already counted, and key exchange plus chain
+    /// verification is genuine work rather than a symptom.
+    pub tls_handshake: Thresholds,
+    /// Days of certificate validity left (lower is worse). Warn at two weeks — enough time
+    /// to renew unhurriedly — and crit at three days, which is the point at which someone
+    /// has to be woken up.
+    pub cert_expiry_days: Thresholds,
     /// NIC errors seen in one probe interval (higher is worse). A healthy interface reports
     /// exactly zero, so the warn level sits at 1 — anything at all is worth knowing about.
     pub interface_errors: Thresholds,
@@ -213,6 +226,8 @@ impl Default for ThresholdConfig {
             bufferbloat: Thresholds::higher_is_worse(100.0, 300.0),
             throughput: Thresholds::lower_is_worse(100.0, 25.0),
             tcp_handshake: Thresholds::higher_is_worse(250.0, 1000.0),
+            tls_handshake: Thresholds::higher_is_worse(400.0, 1500.0),
+            cert_expiry_days: Thresholds::lower_is_worse(14.0, 3.0),
             interface_errors: Thresholds::higher_is_worse(1.0, 10.0),
             trip_after_secs: 3.0,
             clear_after_secs: 15.0,

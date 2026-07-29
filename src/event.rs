@@ -199,6 +199,12 @@ pub async fn run_once(config: Config) -> color_eyre::Result<()> {
         .tick()
         .await,
     );
+    if let Some(mut tls) = crate::metrics::tls::TlsProbe::new(
+        crate::metrics::tls::TlsProbe::default_endpoints(),
+        Duration::from_secs(5),
+    ) {
+        samples.extend(tls.tick().await);
+    }
     samples.extend(
         crate::metrics::routing::RoutingProbe::new(
             config.targets.routing_target.clone(),
@@ -251,6 +257,19 @@ pub async fn run_once(config: Config) -> color_eyre::Result<()> {
             "REFUSED".into()
         };
         println!("  tcp  {name:<16} {v}");
+    }
+    for (name, ep) in &state.tls {
+        let v = if ep.last_ok {
+            format!("{:.0}ms", ep.handshake_ms.latest().unwrap_or(0.0))
+        } else {
+            "FAILED".into()
+        };
+        let cert = match ep.expires_in_days {
+            Some(d) if d < 0 => format!("cert EXPIRED {}d ago", -d),
+            Some(d) => format!("cert {d}d left"),
+            None => "cert —".into(),
+        };
+        println!("  tls  {name:<16} {v:<8} {cert}");
     }
     for (name, t) in &state.targets {
         println!(
@@ -370,6 +389,21 @@ async fn run_inner(terminal: &mut crate::tui::Tui, config: Config) -> color_eyre
         tx.clone(),
         &wake,
     ));
+
+    // TLS negotiation and certificate expiry. Skipped entirely if the platform trust store
+    // will not load: without it there is no verdict worth reporting, and a permissive
+    // fallback would call a bad certificate healthy.
+    if let Some(probe) = crate::metrics::tls::TlsProbe::new(
+        crate::metrics::tls::TlsProbe::default_endpoints(),
+        Duration::from_secs(5),
+    ) {
+        handles.push(spawn_probe(
+            probe,
+            Duration::from_millis(config.cadence.tls_ms),
+            tx.clone(),
+            &wake,
+        ));
+    }
 
     // Passive throughput counters. The probe measures its own interval, so the cadence here
     // only decides how often it is asked, not how the rate is scaled.
