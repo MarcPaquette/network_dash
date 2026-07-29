@@ -177,6 +177,14 @@ pub async fn run_once(config: Config) -> color_eyre::Result<()> {
     }
     let mut dns = crate::metrics::dns::DnsProbe::new(&config.resolvers, Duration::from_secs(2));
     samples.extend(dns.tick().await);
+    samples.extend(
+        crate::metrics::dns::DnsIntegrityProbe::with_clock_seed(
+            &config.resolvers,
+            Duration::from_secs(2),
+        )
+        .tick()
+        .await,
+    );
     let mut reach = crate::metrics::reachability::ReachabilityProbe::new(
         crate::metrics::reachability::ReachabilityProbe::default_endpoints(),
     );
@@ -257,7 +265,8 @@ pub async fn run_once(config: Config) -> color_eyre::Result<()> {
         } else {
             "FAIL".into()
         };
-        println!("  dns  {name:<16} {v}");
+        let integrity = if r.hijacked { "  HIJACK" } else { "" };
+        println!("  dns  {name:<16} {v}{integrity}");
     }
     Ok(())
 }
@@ -334,6 +343,18 @@ async fn run_inner(terminal: &mut crate::tui::Tui, config: Config) -> color_eyre
     handles.push(spawn_probe(
         crate::metrics::iface::InterfaceProbe::new(),
         Duration::from_millis(config.cadence.interface_ms),
+        tx.clone(),
+        &wake,
+    ));
+
+    // Is the resolver answering honestly? A different question from how fast it answers,
+    // asked far less often, because a hijack is a configuration and not a condition.
+    handles.push(spawn_probe(
+        crate::metrics::dns::DnsIntegrityProbe::with_clock_seed(
+            &config.resolvers,
+            Duration::from_secs(2),
+        ),
+        Duration::from_millis(config.cadence.dns_integrity_ms),
         tx.clone(),
         &wake,
     ));

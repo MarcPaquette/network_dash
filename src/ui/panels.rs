@@ -627,10 +627,19 @@ pub fn dns(frame: &mut Frame, area: Rect, state: &AppState) {
             } else {
                 ("FAIL".to_string(), state.theme.crit)
             };
-            ListItem::new(Line::from(vec![
+            let mut spans = vec![
                 Span::raw(format!("{name:<12} ")),
                 Span::styled(format!("{text:>8}"), Style::default().fg(color)),
-            ]))
+            ];
+            // Beside the timing, not instead of it: a hijacking resolver is usually a fast
+            // one, and the speed on its own would read as a clean bill of health.
+            if r.hijacked {
+                spans.push(Span::styled(
+                    "  HIJACK",
+                    Style::default().fg(state.theme.health_color(r.integrity_health_current())),
+                ));
+            }
+            ListItem::new(Line::from(spans))
         })
         .collect();
     frame.render_widget(List::new(items), summary);
@@ -1757,6 +1766,47 @@ mod tests {
                 connect_ms,
             },
         );
+    }
+
+    #[test]
+    fn dns_panel_flags_a_hijacking_resolver_by_name() {
+        let mut state = test_state();
+        state.apply_sample(
+            Utc::now(),
+            Sample::Dns {
+                resolver: "system".into(),
+                latency_ms: Some(12.0),
+            },
+        );
+        state.apply_sample(
+            Utc::now(),
+            Sample::DnsIntegrity {
+                resolver: "system".into(),
+                hijacked: true,
+            },
+        );
+        let mut term = Terminal::new(TestBackend::new(80, 8)).unwrap();
+        term.draw(|f| dns(f, f.area(), &state)).unwrap();
+        let text = buffer_text(&term);
+        assert!(
+            text.contains("HIJACK"),
+            "a fast resolver that lies must not look like a fast resolver: {text}"
+        );
+    }
+
+    #[test]
+    fn dns_panel_stays_quiet_when_the_answers_are_honest() {
+        let mut state = test_state();
+        state.apply_sample(
+            Utc::now(),
+            Sample::DnsIntegrity {
+                resolver: "system".into(),
+                hijacked: false,
+            },
+        );
+        let mut term = Terminal::new(TestBackend::new(80, 8)).unwrap();
+        term.draw(|f| dns(f, f.area(), &state)).unwrap();
+        assert!(!buffer_text(&term).contains("HIJACK"));
     }
 
     #[test]

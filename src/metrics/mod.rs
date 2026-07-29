@@ -81,6 +81,8 @@ pub enum Sample {
         resolver: String,
         latency_ms: Option<f64>,
     },
+    /// Whether a resolver is answering for names it has no business answering for.
+    DnsIntegrity { resolver: String, hijacked: bool },
     /// Passive throughput reading in bytes/sec.
     Throughput { rx_bps: f64, tx_bps: f64 },
     /// Active capacity-probe result in Mbps.

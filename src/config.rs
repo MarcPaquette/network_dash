@@ -114,6 +114,9 @@ fn default_resolvers() -> Vec<Resolver> {
 pub struct Cadence {
     pub ping_ms: u64,
     pub dns_ms: u64,
+    /// DNS honesty checks. Minutes apart on purpose: hijacking is a configuration, not a
+    /// weather condition — it does not start and stop between one lookup and the next.
+    pub dns_integrity_ms: u64,
     pub routing_ms: u64,
     pub throughput_passive_ms: u64,
     pub throughput_probe_ms: u64,
@@ -134,6 +137,7 @@ impl Default for Cadence {
         Self {
             ping_ms: 1000,
             dns_ms: 5000,
+            dns_integrity_ms: 120_000,
             routing_ms: 60_000,
             throughput_passive_ms: 1000,
             throughput_probe_ms: 300_000,

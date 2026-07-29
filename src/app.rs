@@ -122,15 +122,36 @@ impl TargetState {
 /// Per-DNS-resolver rolling state.
 #[derive(Debug, Clone)]
 pub struct ResolverState {
+    /// Whether this resolver was last seen answering for names it does not own.
+    pub hijacked: bool,
     pub latency_ms: Series,
     pub last_ok: bool,
     health: Debouncer,
+    /// Honesty, debounced apart from timing: the two are different faults, and a resolver
+    /// that answers quickly and wrongly must not have its speed excuse its answers.
+    integrity_health: Debouncer,
 }
 
 impl ResolverState {
+    fn new(cfg: &Config) -> Self {
+        let t = &cfg.thresholds;
+        Self {
+            hijacked: false,
+            latency_ms: Series::new(t.history_len),
+            last_ok: true,
+            health: Debouncer::new(Health::Ok, t.trip_after(), t.clear_after()),
+            integrity_health: Debouncer::new(Health::Ok, t.trip_after(), t.clear_after()),
+        }
+    }
+
     /// Current debounced health of this resolver (read by the diagnosis engine).
     pub fn health_current(&self) -> Health {
         self.health.current()
+    }
+
+    /// Current debounced integrity verdict.
+    pub fn integrity_health_current(&self) -> Health {
+        self.integrity_health.current()
     }
 }
 
@@ -386,6 +407,9 @@ impl AppState {
                 resolver,
                 latency_ms,
             } => self.apply_dns(now, &resolver, latency_ms),
+            Sample::DnsIntegrity { resolver, hijacked } => {
+                self.apply_dns_integrity(now, &resolver, hijacked)
+            }
             Sample::TcpHandshake {
                 endpoint,
                 connect_ms,
@@ -724,15 +748,7 @@ impl AppState {
         let state = self
             .resolvers
             .entry(resolver.to_string())
-            .or_insert_with(|| ResolverState {
-                latency_ms: Series::new(cfg.thresholds.history_len),
-                last_ok: true,
-                health: Debouncer::new(
-                    Health::Ok,
-                    cfg.thresholds.trip_after(),
-                    cfg.thresholds.clear_after(),
-                ),
-            });
+            .or_insert_with(|| ResolverState::new(&cfg));
         let raw = match latency_ms {
             Some(ms) => {
                 state.latency_ms.push(ms);
@@ -835,6 +851,45 @@ impl AppState {
                 latest,
                 "ms",
                 &thr,
+            )],
+            None => Vec::new(),
+        }
+    }
+
+    /// Fold a DNS-honesty verdict, kept on its own debouncer.
+    ///
+    /// Separate from the timing verdict because they are different faults with different
+    /// fixes — a hijacking resolver is usually fast, and swapping resolvers fixes the one
+    /// but not the other. Both feed the DNS panel, so the border still reflects the worse.
+    fn apply_dns_integrity(
+        &mut self,
+        now: DateTime<Utc>,
+        resolver: &str,
+        hijacked: bool,
+    ) -> Vec<Incident> {
+        let cfg = self.config.clone();
+        let state = self
+            .resolvers
+            .entry(resolver.to_string())
+            .or_insert_with(|| ResolverState::new(&cfg));
+        state.hijacked = hijacked;
+        // Warn, never Crit: the resolver is answering and names still resolve. What is wrong
+        // is who is answering, which is worth knowing and is not an outage.
+        let raw = if hijacked { Health::Warn } else { Health::Ok };
+        match state.integrity_health.update(now, raw) {
+            Some(Health::Ok) => vec![status_incident(
+                now,
+                MetricId::Dns,
+                resolver,
+                Health::Ok,
+                format!("dns answers are the resolver's own again ({resolver})"),
+            )],
+            Some(sev) => vec![status_incident(
+                now,
+                MetricId::Dns,
+                resolver,
+                sev,
+                format!("dns integrity: {resolver} answers for names it does not own"),
             )],
             None => Vec::new(),
         }
@@ -1295,7 +1350,13 @@ impl AppState {
             MetricId::Loss => {
                 Health::worst_of(self.targets.values().map(|t| t.loss_health.current()))
             }
-            MetricId::Dns => Health::worst_of(self.resolvers.values().map(|r| r.health.current())),
+            // Speed and honesty both land on the DNS panel: a resolver answering instantly
+            // for names it does not own is not a healthy resolver.
+            MetricId::Dns => Health::worst_of(
+                self.resolvers
+                    .values()
+                    .map(|r| r.health.current().worst(r.integrity_health.current())),
+            ),
             // Capacity and bufferbloat share the Throughput panel: a link can be "up and
             // fast" yet unusable under load, so the border must reflect the worse of the two.
             MetricId::Throughput | MetricId::Bufferbloat => {
@@ -2191,6 +2252,63 @@ mod tests {
             !s.targets.contains_key("2606:4700:4700::1111"),
             "an unpingable target has an empty series, which renders as a perfect 0ms/0% \
              — the most misleading thing the panel could say"
+        );
+    }
+
+    // --- dns integrity ---
+
+    fn integrity(resolver: &str, hijacked: bool) -> Sample {
+        Sample::DnsIntegrity {
+            resolver: resolver.into(),
+            hijacked,
+        }
+    }
+
+    #[test]
+    fn an_honest_resolver_is_not_remarked_upon() {
+        let mut s = AppState::new(test_config());
+        let mut c = Clock::new();
+        let quiet = drive(&mut s, &mut c, 4, || integrity("system", false));
+        assert!(quiet.is_empty(), "{quiet:#?}");
+        assert!(!s.resolvers["system"].hijacked);
+        assert_eq!(s.panel_health(MetricId::Dns), Health::Ok);
+    }
+
+    #[test]
+    fn a_hijacking_resolver_warns_and_reddens_the_dns_panel() {
+        let mut s = AppState::new(test_config());
+        let mut c = Clock::new();
+        let out = drive(&mut s, &mut c, 3, || integrity("system", true));
+        assert_eq!(out.len(), 1, "{out:#?}");
+        assert_eq!(out[0].metric, MetricId::Dns);
+        assert_eq!(out[0].target.as_deref(), Some("system"));
+        // Warn, not Crit: the resolver is answering, it is just answering for names it has
+        // no business answering for. Names still resolve; the dashboard is not down.
+        assert_eq!(out[0].severity, Health::Warn);
+        assert!(s.resolvers["system"].hijacked);
+        assert_eq!(s.panel_health(MetricId::Dns), Health::Warn);
+    }
+
+    #[test]
+    fn a_resolver_that_stops_hijacking_says_so() {
+        let mut s = AppState::new(test_config());
+        let mut c = Clock::new();
+        drive(&mut s, &mut c, 3, || integrity("system", true));
+        let out = drive(&mut s, &mut c, 3, || integrity("system", false));
+        assert_eq!(out.len(), 1, "{out:#?}");
+        assert_eq!(out[0].severity, Health::Ok);
+        assert!(!s.resolvers["system"].hijacked);
+    }
+
+    #[test]
+    fn a_hijack_does_not_disturb_the_resolvers_timing_verdict() {
+        let mut s = AppState::new(test_config());
+        let mut c = Clock::new();
+        drive(&mut s, &mut c, 3, || integrity("system", true));
+        assert_eq!(
+            s.resolvers["system"].health_current(),
+            Health::Ok,
+            "lookups are still fast; only their honesty is in question"
         );
     }
 
