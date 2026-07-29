@@ -179,6 +179,7 @@ pub async fn run_once(config: Config) -> color_eyre::Result<()> {
     );
     samples.extend(reach.tick().await);
     samples.extend(crate::metrics::link::WifiProbe.tick().await);
+    samples.extend(crate::metrics::iface::InterfaceProbe::new().tick().await);
     samples.extend(
         crate::metrics::routing::RoutingProbe::new(
             config.targets.routing_target.clone(),
@@ -214,7 +215,14 @@ pub async fn run_once(config: Config) -> color_eyre::Result<()> {
         MetricId::Throughput,
         MetricId::Link,
     ] {
-        println!("  {:<12} {}", m.label(), badge(state.panel_health(m)));
+        println!("  {:<16} {}", m.label(), badge(state.panel_health(m)));
+    }
+    if let (Some(rx), Some(tx)) = (state.iface.rx_errors, state.iface.tx_errors) {
+        println!(
+            "  {:<16} {}  ({rx} rx, {tx} tx)",
+            MetricId::InterfaceErrors.label(),
+            badge(state.iface.health_current())
+        );
     }
     for (name, t) in &state.targets {
         println!(
@@ -301,11 +309,19 @@ async fn run_inner(terminal: &mut crate::tui::Tui, config: Config) -> color_eyre
         &wake,
     ));
 
-    // Passive throughput counters.
-    let tput_interval = Duration::from_millis(config.cadence.throughput_passive_ms);
+    // Local NIC error counters — free, and the only probe that can blame your own hardware.
     handles.push(spawn_probe(
-        crate::metrics::throughput::ThroughputProbe::new(tput_interval),
-        tput_interval,
+        crate::metrics::iface::InterfaceProbe::new(),
+        Duration::from_millis(config.cadence.interface_ms),
+        tx.clone(),
+        &wake,
+    ));
+
+    // Passive throughput counters. The probe measures its own interval, so the cadence here
+    // only decides how often it is asked, not how the rate is scaled.
+    handles.push(spawn_probe(
+        crate::metrics::throughput::ThroughputProbe::new(),
+        Duration::from_millis(config.cadence.throughput_passive_ms),
         tx.clone(),
         &wake,
     ));

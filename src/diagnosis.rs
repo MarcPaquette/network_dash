@@ -16,6 +16,8 @@ use crate::health::Health;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Layer {
+    /// The local network card itself — errors and dropped frames on your own hardware.
+    Nic,
     /// Local wireless radio (weak signal / bad SNR).
     Wifi,
     /// The LAN path to the default gateway / router.
@@ -32,6 +34,7 @@ impl Layer {
     /// Short tag shown in the diagnosis panel.
     pub fn tag(self) -> &'static str {
         match self {
+            Layer::Nic => "NIC",
             Layer::Wifi => "WI-FI",
             Layer::Gateway => "GATEWAY",
             Layer::Isp => "ISP/WAN",
@@ -44,13 +47,15 @@ impl Layer {
     /// makes every hop past it look broken, and nothing past it can break the radio.
     ///
     /// DNS and a single bad remote host share a rank — both live past the ISP, on branches
-    /// that don't touch each other.
+    /// that don't touch each other. The NIC sits ahead of the radio: the card is the thing
+    /// the radio runs on, so a card shedding frames breaks the link and never the reverse.
     fn distance(self) -> u8 {
         match self {
-            Layer::Wifi => 0,
-            Layer::Gateway => 1,
-            Layer::Isp => 2,
-            Layer::Dns | Layer::Remote => 3,
+            Layer::Nic => 0,
+            Layer::Wifi => 1,
+            Layer::Gateway => 2,
+            Layer::Isp => 3,
+            Layer::Dns | Layer::Remote => 4,
         }
     }
 
@@ -104,6 +109,9 @@ struct Signals {
     tx_rate: Option<f64>,
     /// A captive portal is intercepting web traffic (sign-in required).
     captive: bool,
+    /// Local NIC error health, and the error count that produced it.
+    nic_errors: Health,
+    nic_error_count: Option<f64>,
     /// Bufferbloat: health and the added latency (ms) measured under load.
     bufferbloat: Health,
     bufferbloat_ms: Option<f64>,
@@ -130,6 +138,8 @@ impl Default for Signals {
             snr_db: Some(45.0),
             tx_rate: Some(866.0),
             captive: false,
+            nic_errors: Health::Ok,
+            nic_error_count: None,
             bufferbloat: Health::Ok,
             bufferbloat_ms: None,
         }
@@ -219,6 +229,11 @@ impl Signals {
             snr_db,
             tx_rate,
             captive: state.captive_portal,
+            nic_errors: state.iface.health_current(),
+            nic_error_count: match (state.iface.rx_errors, state.iface.tx_errors) {
+                (Some(rx), Some(tx)) => Some((rx + tx) as f64),
+                _ => None,
+            },
             bufferbloat: state.throughput.bufferbloat_health_current(),
             bufferbloat_ms: match (
                 state.throughput.idle_latency_ms,
@@ -262,6 +277,24 @@ fn diagnose_signals(s: &Signals) -> Vec<Diagnosis> {
     let gateway_unhealthy = matches!(s.gateway, Some(h) if h > Health::Ok);
     // Treat a missing gateway as "not a local problem" so we don't wrongly blame the LAN.
     let gateway_ok_or_absent = !gateway_unhealthy;
+
+    // 0. The card itself. First, because it is upstream of every other layer and because it
+    // is the one fault none of the network-side probes can see: a NIC shedding frames looks
+    // like a weak radio, a bad gateway and a flaky ISP all at once, and none of those is what
+    // needs replacing.
+    if s.nic_errors > Health::Ok {
+        let mut evidence = vec!["errors on the local interface".to_string()];
+        if let Some(n) = s.nic_error_count {
+            evidence.insert(0, format!("{n:.0} errors in the last interval"));
+        }
+        out.push(Diagnosis {
+            layer: Some(Layer::Nic),
+            severity: s.nic_errors,
+            headline: "Network interface is dropping frames — check the cable, port or driver"
+                .into(),
+            evidence,
+        });
+    }
 
     // 1. Wi-Fi radio. Distinguish a weak *signal* (RSSI) from poor *quality* (low SNR /
     // interference); a weak signal paired with gateway loss points at the local link.
@@ -526,6 +559,42 @@ mod tests {
     }
 
     #[test]
+    fn a_failing_nic_is_blamed_ahead_of_everything_it_breaks() {
+        // A card shedding frames looks exactly like a weak radio and a bad gateway from
+        // every other probe. It is neither, and replacing the access point won't fix it.
+        let d = diagnose_signals(&Signals {
+            nic_errors: Health::Crit,
+            nic_error_count: Some(42.0),
+            wifi_signal: Health::Warn,
+            gateway: Some(Health::Warn),
+            ..Default::default()
+        });
+        let top = d.first().expect("a verdict");
+        assert_eq!(top.layer, Some(Layer::Nic));
+        assert_eq!(top.severity, Health::Crit);
+        assert!(
+            top.headline.to_lowercase().contains("interface")
+                || top.headline.to_lowercase().contains("nic"),
+            "should name the hardware: {}",
+            top.headline
+        );
+        assert_eq!(primary_of(&d), Some(Layer::Nic));
+    }
+
+    #[test]
+    fn a_clean_nic_is_never_mentioned() {
+        let d = diagnose_signals(&Signals {
+            nic_errors: Health::Ok,
+            wifi_signal: Health::Warn,
+            ..Default::default()
+        });
+        assert!(
+            d.iter().all(|x| x.layer != Some(Layer::Nic)),
+            "nothing to say about a card that works: {d:?}"
+        );
+    }
+
+    #[test]
     fn captive_portal_is_reported_before_a_generic_outage() {
         // A portal makes reachability fail; without the captive signal this looks like an
         // ISP outage. The dedicated captive verdict should lead and be the only ISP verdict.
@@ -662,7 +731,8 @@ mod tests {
 
     // --- root-cause ordering ---
 
-    const ALL_LAYERS: [Layer; 5] = [
+    const ALL_LAYERS: [Layer; 6] = [
+        Layer::Nic,
         Layer::Wifi,
         Layer::Gateway,
         Layer::Isp,
@@ -672,6 +742,10 @@ mod tests {
 
     #[test]
     fn an_upstream_fault_explains_a_downstream_symptom() {
+        // The card is upstream of everything, radio included: a NIC shedding frames breaks
+        // the Wi-Fi link, never the other way round.
+        assert!(Layer::Nic.explains(Layer::Wifi));
+        assert!(Layer::Nic.explains(Layer::Remote));
         assert!(Layer::Wifi.explains(Layer::Gateway));
         assert!(Layer::Wifi.explains(Layer::Dns));
         assert!(Layer::Gateway.explains(Layer::Isp));
@@ -681,6 +755,7 @@ mod tests {
 
     #[test]
     fn a_downstream_fault_never_explains_its_upstream() {
+        assert!(!Layer::Wifi.explains(Layer::Nic));
         assert!(!Layer::Dns.explains(Layer::Isp));
         assert!(!Layer::Isp.explains(Layer::Gateway));
         assert!(!Layer::Remote.explains(Layer::Wifi));

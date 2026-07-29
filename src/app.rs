@@ -153,6 +153,27 @@ pub struct LinkState {
     health: Option<Debouncer>,
 }
 
+/// Local NIC error counters, as of the last reading.
+///
+/// `None` until the first sample lands: "no interface probe has run yet" and "the NIC is
+/// clean" look identical as a zero, and only one of them is worth putting on screen.
+#[derive(Debug, Clone, Default)]
+pub struct InterfaceState {
+    pub rx_errors: Option<u64>,
+    pub tx_errors: Option<u64>,
+    /// Total errors per interval over time. Errors usually arrive in bursts, so the trend
+    /// distinguishes "one bad moment" from "this cable is failing".
+    pub history: Option<Series>,
+    health: Option<Debouncer>,
+}
+
+impl InterfaceState {
+    /// Committed NIC-error health (`Ok` before the first reading).
+    pub fn health_current(&self) -> Health {
+        self.health.as_ref().map_or(Health::Ok, |d| d.current())
+    }
+}
+
 /// Routing/path state for the routing target.
 #[derive(Debug, Clone, Default)]
 pub struct RoutingState {
@@ -203,6 +224,8 @@ pub struct AppState {
     pub reachability: BTreeMap<String, ReachState>,
     pub throughput: ThroughputState,
     pub link: LinkState,
+    /// Local NIC error counters — the only signal that points at your own hardware.
+    pub iface: InterfaceState,
     pub routing: RoutingState,
     /// Whether a captive portal is currently intercepting web traffic.
     pub captive_portal: bool,
@@ -250,6 +273,7 @@ impl AppState {
             reachability: BTreeMap::new(),
             throughput: ThroughputState::default(),
             link: LinkState::default(),
+            iface: InterfaceState::default(),
             routing: RoutingState::default(),
             captive_portal: false,
             captive_health: None,
@@ -309,6 +333,10 @@ impl AppState {
             Sample::Bufferbloat { idle_ms, loaded_ms } => {
                 self.apply_bufferbloat(now, idle_ms, loaded_ms)
             }
+            Sample::InterfaceErrors {
+                rx_errors,
+                tx_errors,
+            } => self.apply_interface_errors(now, rx_errors, tx_errors),
             Sample::Link {
                 rssi_dbm,
                 noise_dbm,
@@ -443,6 +471,9 @@ impl AppState {
                     .is_some_and(|t| t.is_gateway);
                 Some(if gateway { Layer::Gateway } else { Layer::Isp })
             }
+            // The NIC is upstream of everything, including the radio: a card dropping
+            // frames breaks the Wi-Fi link rather than the other way round.
+            MetricId::InterfaceErrors => Some(Layer::Nic),
             MetricId::Link => Some(Layer::Wifi),
             MetricId::Reachability
             | MetricId::Routing
@@ -791,6 +822,58 @@ impl AppState {
         }
     }
 
+    fn apply_interface_errors(
+        &mut self,
+        now: DateTime<Utc>,
+        rx_errors: u64,
+        tx_errors: u64,
+    ) -> Vec<Incident> {
+        let cfg = self.config.clone();
+        self.iface.rx_errors = Some(rx_errors);
+        self.iface.tx_errors = Some(tx_errors);
+        let total = (rx_errors + tx_errors) as f64;
+        self.iface
+            .history
+            .get_or_insert_with(|| Series::new(cfg.thresholds.history_len))
+            .push(total);
+        let thr = cfg.thresholds.interface_errors;
+        let raw = thr.evaluate(total);
+        let health = self.iface.health.get_or_insert_with(|| {
+            Debouncer::new(
+                Health::Ok,
+                cfg.thresholds.trip_after(),
+                cfg.thresholds.clear_after(),
+            )
+        });
+        match health.update(now, raw) {
+            Some(Health::Ok) => vec![status_incident(
+                now,
+                MetricId::InterfaceErrors,
+                "nic",
+                Health::Ok,
+                "interface errors cleared".to_string(),
+            )],
+            Some(sev) => {
+                // Both directions named even when one is zero: inbound errors point at the
+                // cable, the port or the radio, outbound ones at the driver or the card, and
+                // the split is the whole diagnostic value of the number.
+                let inc = Incident::new(
+                    now,
+                    MetricId::InterfaceErrors,
+                    sev,
+                    format!("interface errors: {rx_errors} rx, {tx_errors} tx"),
+                )
+                .with_value(total, "")
+                .with_target("nic");
+                vec![match sev {
+                    Health::Crit => inc.with_threshold(thr.crit),
+                    _ => inc.with_threshold(thr.warn),
+                }]
+            }
+            None => Vec::new(),
+        }
+    }
+
     fn apply_captive(&mut self, now: DateTime<Utc>, detected: bool) -> Vec<Incident> {
         let cfg = self.config.thresholds.clone();
         // Debounced like every other verdict: a single intercepted request is as likely to be
@@ -1095,7 +1178,10 @@ impl AppState {
             // The "Link & Reachability" panel combines the wireless link, all endpoints, and
             // the captive-portal verdict — a sign-in wall is a total loss of web access even
             // while every endpoint below HTTP answers.
-            MetricId::Link | MetricId::Reachability | MetricId::CaptivePortal => {
+            MetricId::Link
+            | MetricId::Reachability
+            | MetricId::CaptivePortal
+            | MetricId::InterfaceErrors => {
                 let link = self
                     .link
                     .health
@@ -1107,7 +1193,9 @@ impl AppState {
                     .captive_health
                     .as_ref()
                     .map_or(Health::Ok, |d| d.current());
-                link.worst(reach).worst(captive)
+                link.worst(reach)
+                    .worst(captive)
+                    .worst(self.iface.health_current())
             }
             // Self-reporting, not a network panel. A broken log must not turn the overall
             // verdict red — the network is fine, the disk isn't; the header badge says so.
@@ -1914,6 +2002,82 @@ mod tests {
         assert_eq!(cleared.len(), 1, "{cleared:#?}");
         assert_eq!(cleared[0].severity, Health::Ok);
         assert!(!s.captive_portal);
+    }
+
+    // --- interface errors ---
+
+    fn errors(rx: u64, tx: u64) -> Sample {
+        Sample::InterfaceErrors {
+            rx_errors: rx,
+            tx_errors: tx,
+        }
+    }
+
+    #[test]
+    fn a_clean_nic_reports_nothing() {
+        let mut s = AppState::new(test_config());
+        let mut c = Clock::new();
+        let quiet = drive(&mut s, &mut c, 4, || errors(0, 0));
+        assert!(
+            quiet.is_empty(),
+            "zero errors is the normal case: {quiet:#?}"
+        );
+        assert_eq!(s.panel_health(MetricId::InterfaceErrors), Health::Ok);
+        assert_eq!(s.iface.rx_errors, Some(0));
+    }
+
+    #[test]
+    fn a_nic_dropping_frames_warns_and_says_which_direction() {
+        let mut s = AppState::new(test_config());
+        let mut c = Clock::new();
+        let raised = drive(&mut s, &mut c, 2, || errors(3, 0));
+        assert_eq!(raised.len(), 1, "{raised:#?}");
+        assert_eq!(raised[0].metric, MetricId::InterfaceErrors);
+        assert_eq!(raised[0].severity, Health::Warn);
+        assert!(
+            raised[0].message.contains("rx"),
+            "name the direction — inbound and outbound errors have different causes: {:?}",
+            raised[0]
+        );
+        assert_eq!(s.iface.rx_errors, Some(3));
+        assert_eq!(s.iface.tx_errors, Some(0));
+    }
+
+    #[test]
+    fn a_flood_of_interface_errors_is_critical() {
+        let mut s = AppState::new(test_config());
+        let mut c = Clock::new();
+        let raised = drive(&mut s, &mut c, 2, || errors(40, 20));
+        assert_eq!(raised.len(), 1, "{raised:#?}");
+        assert_eq!(raised[0].severity, Health::Crit);
+    }
+
+    #[test]
+    fn interface_errors_colour_the_link_panel_and_clear_again() {
+        let mut s = AppState::new(test_config());
+        let mut c = Clock::new();
+        drive(&mut s, &mut c, 2, || errors(40, 0));
+        assert_eq!(
+            s.panel_health(MetricId::Link),
+            Health::Crit,
+            "a NIC shedding frames is a link fault, whatever the radio says"
+        );
+        let cleared = drive(&mut s, &mut c, 2, || errors(0, 0));
+        assert_eq!(cleared.len(), 1, "{cleared:#?}");
+        assert_eq!(cleared[0].severity, Health::Ok);
+        assert_eq!(s.panel_health(MetricId::Link), Health::Ok);
+    }
+
+    #[test]
+    fn interface_errors_keep_a_history() {
+        let mut s = AppState::new(test_config());
+        let mut c = Clock::new();
+        for n in [1u64, 5, 2] {
+            s.apply_sample(c.tick(), errors(n, 0));
+        }
+        let h = s.iface.history.as_ref().expect("a series after samples");
+        assert_eq!(h.len(), 3);
+        assert_eq!(h.max(), Some(5.0));
     }
 
     // --- metric identity ---

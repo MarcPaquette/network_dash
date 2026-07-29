@@ -9,6 +9,7 @@ use std::future::Future;
 use serde::{Deserialize, Serialize};
 
 pub mod dns;
+pub mod iface;
 pub mod link;
 pub mod ping;
 pub mod proc;
@@ -31,6 +32,8 @@ pub enum MetricId {
     /// Latency added under load. Drawn in the throughput panel, but a distinct fault with a
     /// distinct fix, so it is logged and correlated under its own name.
     Bufferbloat,
+    /// Frames the local NIC failed to send or receive — a hardware fault, not a network one.
+    InterfaceErrors,
     Reachability,
     /// Web traffic is being intercepted and a sign-in is required.
     CaptivePortal,
@@ -52,6 +55,7 @@ impl MetricId {
             MetricId::Routing => "routing",
             MetricId::Throughput => "throughput",
             MetricId::Bufferbloat => "bufferbloat",
+            MetricId::InterfaceErrors => "interface errors",
             MetricId::Reachability => "reachability",
             MetricId::CaptivePortal => "captive portal",
             MetricId::PublicIp => "public ip",
@@ -78,6 +82,8 @@ pub enum Sample {
     ThroughputProbe { mbps: f64 },
     /// Latency measured while idle vs while the link is saturated (bufferbloat), in ms.
     Bufferbloat { idle_ms: f64, loaded_ms: f64 },
+    /// Frames the local NIC failed to receive/transmit since the previous reading.
+    InterfaceErrors { rx_errors: u64, tx_errors: u64 },
     /// Reachability check for a named endpoint.
     Reachability { endpoint: String, ok: bool },
     /// Captive-portal detection result (a login page intercepting web traffic).

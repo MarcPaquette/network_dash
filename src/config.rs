@@ -108,6 +108,9 @@ pub struct Cadence {
     pub throughput_probe_ms: u64,
     pub reachability_ms: u64,
     pub link_ms: u64,
+    /// NIC error counters. Cheap enough to poll often — it is a counter read, not a probe —
+    /// but errors are counted per interval, so a short one makes every burst look small.
+    pub interface_ms: u64,
     pub public_ip_ms: u64,
     pub render_ms: u64,
 }
@@ -122,6 +125,7 @@ impl Default for Cadence {
             throughput_probe_ms: 300_000,
             reachability_ms: 15_000,
             link_ms: 15_000,
+            interface_ms: 10_000,
             public_ip_ms: 300_000,
             render_ms: 200,
         }
@@ -153,6 +157,9 @@ pub struct ThresholdConfig {
     pub bufferbloat: Thresholds,
     /// Measured link capacity in Mbps (lower is worse).
     pub throughput: Thresholds,
+    /// NIC errors seen in one probe interval (higher is worse). A healthy interface reports
+    /// exactly zero, so the warn level sits at 1 — anything at all is worth knowing about.
+    pub interface_errors: Thresholds,
     /// How long a degradation must persist before it is reported, in seconds.
     pub trip_after_secs: f64,
     /// How long a recovery must hold before it is reported, in seconds. Longer than
@@ -182,6 +189,7 @@ impl Default for ThresholdConfig {
             snr: Thresholds::lower_is_worse(20.0, 10.0),
             bufferbloat: Thresholds::higher_is_worse(100.0, 300.0),
             throughput: Thresholds::lower_is_worse(100.0, 25.0),
+            interface_errors: Thresholds::higher_is_worse(1.0, 10.0),
             trip_after_secs: 3.0,
             clear_after_secs: 15.0,
             debounce_samples: None,

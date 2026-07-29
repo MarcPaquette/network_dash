@@ -674,6 +674,13 @@ pub fn link(frame: &mut Frame, area: Rect, state: &AppState) {
     if state.vpn {
         wifi_parts.push("VPN".into());
     }
+    // Only when there is something to report. A permanent "err 0 rx, 0 tx" costs a quarter
+    // of the line to say "normal", and trains the eye to skip the place the number appears.
+    if let (Some(rx), Some(tx)) = (state.iface.rx_errors, state.iface.tx_errors)
+        && rx + tx > 0
+    {
+        wifi_parts.push(format!("err {rx} rx / {tx} tx"));
+    }
 
     // Endpoint checklist packed onto a single line to fit the compact band.
     let mut spans = Vec::new();
@@ -1692,6 +1699,32 @@ mod tests {
         assert!(text.contains("utun3"), "should show interface: {text}");
         assert!(text.contains("MTU 1400"), "should show MTU: {text}");
         assert!(text.contains("VPN"), "should badge VPN: {text}");
+    }
+
+    #[test]
+    fn link_panel_stays_quiet_about_a_clean_nic() {
+        let mut state = test_state();
+        state.iface.rx_errors = Some(0);
+        state.iface.tx_errors = Some(0);
+        let mut term = Terminal::new(TestBackend::new(80, 8)).unwrap();
+        term.draw(|f| link(f, f.area(), &state)).unwrap();
+        let text = buffer_text(&term);
+        assert!(
+            !text.contains("err"),
+            "zero errors is the normal case; a permanent 'err 0' is just noise: {text}"
+        );
+    }
+
+    #[test]
+    fn link_panel_names_the_direction_of_nic_errors() {
+        let mut state = test_state();
+        state.iface.rx_errors = Some(7);
+        state.iface.tx_errors = Some(2);
+        let mut term = Terminal::new(TestBackend::new(80, 8)).unwrap();
+        term.draw(|f| link(f, f.area(), &state)).unwrap();
+        let text = buffer_text(&term);
+        assert!(text.contains("err 7 rx"), "should show rx errors: {text}");
+        assert!(text.contains("2 tx"), "should show tx errors: {text}");
     }
 
     #[test]
