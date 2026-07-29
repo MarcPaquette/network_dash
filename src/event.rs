@@ -186,7 +186,10 @@ pub async fn run_once(config: Config) -> color_eyre::Result<()> {
         .await,
     );
     let mut reach = crate::metrics::reachability::ReachabilityProbe::new(
-        crate::metrics::reachability::ReachabilityProbe::default_endpoints(),
+        crate::metrics::reachability::checkable_endpoints(
+            crate::metrics::reachability::ReachabilityProbe::default_endpoints(),
+            crate::metrics::ping::has_ipv6_route(),
+        ),
     );
     samples.extend(reach.tick().await);
     samples.extend(crate::metrics::link::WifiProbe.tick().await);
@@ -351,7 +354,10 @@ async fn run_inner(terminal: &mut crate::tui::Tui, config: Config) -> color_eyre
     // HTTP(S) reachability + captive/IPv6.
     handles.push(spawn_probe(
         crate::metrics::reachability::ReachabilityProbe::new(
-            crate::metrics::reachability::ReachabilityProbe::default_endpoints(),
+            crate::metrics::reachability::checkable_endpoints(
+                crate::metrics::reachability::ReachabilityProbe::default_endpoints(),
+                crate::metrics::ping::has_ipv6_route(),
+            ),
         ),
         Duration::from_millis(config.cadence.reachability_ms),
         tx.clone(),

@@ -97,6 +97,19 @@ struct Signals {
     /// Any reachability endpoint currently OK / all of them failing.
     reach_any_ok: bool,
     reach_all_fail: bool,
+    /// How many endpoints are checked and how many are failing. `reach_all_fail` cannot tell
+    /// "one host is down" from "the internet is down", and those are different verdicts.
+    reach_total: usize,
+    reach_bad: usize,
+    /// Worst TCP/TLS handshake health, and the endpoints that failed outright. Ping cannot
+    /// see this: a host can answer ICMP instantly and still refuse every connection.
+    transport: Health,
+    transport_failed: Vec<String>,
+    /// Certificate expiry: worst health, and the endpoint running out soonest with its days
+    /// remaining. Kept apart from `transport` because a valid-but-expiring certificate is
+    /// not a transport fault — the handshake it came from was perfect.
+    cert: Health,
+    cert_soonest: Option<(String, i64)>,
     /// Routing probe: whether it has run, and whether the target is reachable.
     routing_seen: bool,
     routing_reachable: bool,
@@ -130,6 +143,12 @@ impl Default for Signals {
             dns_public: Health::Ok,
             reach_any_ok: true,
             reach_all_fail: false,
+            reach_total: 2,
+            reach_bad: 0,
+            transport: Health::Ok,
+            transport_failed: Vec::new(),
+            cert: Health::Ok,
+            cert_soonest: None,
             routing_seen: true,
             routing_reachable: true,
             wifi_signal: Health::Ok,
@@ -189,16 +208,54 @@ impl Signals {
         let mut reach_any_ok = false;
         let mut reach_seen = false;
         let mut reach_all_fail = true;
+        let mut reach_total = 0;
+        let mut reach_bad = 0;
         for r in state.reachability.values() {
             reach_seen = true;
+            reach_total += 1;
             if r.ok {
                 reach_any_ok = true;
                 reach_all_fail = false;
+            } else {
+                reach_bad += 1;
             }
         }
         if !reach_seen {
             reach_all_fail = false;
         }
+
+        // Transport: TCP and TLS timings together. They are one panel and one complaint —
+        // "a real connection to this host does not work well" — and splitting the verdict
+        // would report the same outage twice for endpoints that appear in both probes.
+        let transport = Health::worst_of(
+            state
+                .tcp
+                .values()
+                .map(|t| t.health_current())
+                .chain(state.tls.values().map(|t| t.health_current())),
+        );
+        let mut transport_failed: Vec<String> = state
+            .tcp
+            .iter()
+            .filter(|(_, t)| !t.last_ok)
+            .map(|(n, _)| n.clone())
+            .chain(
+                state
+                    .tls
+                    .iter()
+                    .filter(|(_, t)| !t.last_ok)
+                    .map(|(n, _)| n.clone()),
+            )
+            .collect();
+        transport_failed.sort();
+        transport_failed.dedup();
+
+        let cert = Health::worst_of(state.tls.values().map(|t| t.expiry_health_current()));
+        let cert_soonest = state
+            .tls
+            .iter()
+            .filter_map(|(n, t)| t.expires_in_days.map(|d| (n.clone(), d)))
+            .min_by_key(|(_, d)| *d);
 
         // Wi-Fi: classify RSSI (signal) and SNR (quality) against their thresholds — a live,
         // un-debounced read. SNR = signal − noise, only when both are known.
@@ -221,6 +278,12 @@ impl Signals {
             dns_public,
             reach_any_ok,
             reach_all_fail,
+            reach_total,
+            reach_bad,
+            transport,
+            transport_failed,
+            cert,
+            cert_soonest,
             routing_seen: state.routing.seen,
             routing_reachable: state.routing.reachable,
             wifi_signal,
@@ -434,6 +497,58 @@ fn diagnose_signals(s: &Signals) -> Vec<Diagnosis> {
         }
     }
 
+    // 4b. Transport. A host that answers ICMP can still refuse every connection, and a
+    // handshake that succeeds slowly is invisible to every other probe on the dashboard.
+    // Reported even when the ISP rules above fired, because "your ISP is degraded" does not
+    // tell you that a specific service is refusing you outright.
+    if s.transport > Health::Ok {
+        let evidence = if s.transport_failed.is_empty() {
+            vec!["handshakes are slow".to_string()]
+        } else {
+            vec![format!(
+                "no connection to {}",
+                s.transport_failed.join(", ")
+            )]
+        };
+        let headline = if s.transport_failed.is_empty() {
+            "Connections are slow to establish though the path itself looks healthy".to_string()
+        } else {
+            "Connections are being refused or timing out (TCP/TLS)".to_string()
+        };
+        out.push(Diagnosis {
+            layer: Some(Layer::Isp),
+            severity: s.transport,
+            headline,
+            evidence,
+        });
+    }
+
+    // 4c. Certificate expiry. Deliberately unlocalized: every layer is working, the
+    // handshake succeeded, and the only thing wrong is a date. Blaming a layer for it would
+    // be false, and would let an unrelated outage suppress the one warning nothing repeats.
+    if s.cert > Health::Ok {
+        let (headline, evidence) = match &s.cert_soonest {
+            Some((name, days)) if *days < 0 => (
+                "A TLS certificate has expired".to_string(),
+                vec![format!("{name}: expired {}d ago", -days)],
+            ),
+            Some((name, days)) => (
+                format!("A TLS certificate expires in {days} days"),
+                vec![format!("{name}: {days}d left")],
+            ),
+            None => (
+                "A TLS certificate is close to expiry".to_string(),
+                Vec::new(),
+            ),
+        };
+        out.push(Diagnosis {
+            layer: None,
+            severity: s.cert,
+            headline,
+            evidence,
+        });
+    }
+
     // 5. Remote host. Some internet hosts are bad while others are fine.
     if gateway_ok_or_absent
         && s.internet_total > 0
@@ -452,6 +567,21 @@ fn diagnose_signals(s: &Signals) -> Vec<Diagnosis> {
                 s.internet_bad, s.internet_total
             ),
             evidence: vec![format!("worst host: {host}")],
+        });
+    }
+
+    // 5b. A minority of web endpoints failing. Not an outage — the others answered — but the
+    // panel goes red for it, so something has to say why. Without this the header claims a
+    // problem the panel below it cannot name.
+    if !s.reach_all_fail && s.reach_bad > 0 && s.reach_bad < s.reach_total {
+        out.push(Diagnosis {
+            layer: Some(Layer::Remote),
+            severity: Health::Crit,
+            headline: format!(
+                "{} of {} web endpoints unreachable; the rest of your connection is healthy",
+                s.reach_bad, s.reach_total
+            ),
+            evidence: vec!["likely that service rather than your network".into()],
         });
     }
 
@@ -493,6 +623,125 @@ mod tests {
         assert_eq!(d[0].layer, None);
         assert_eq!(d[0].severity, Health::Ok);
         assert_eq!(d[0].headline, "No problems detected");
+    }
+
+    /// Every state the header can call unhealthy must be a state the diagnosis panel can
+    /// explain. Otherwise the banner says PROBLEM while the panel directly beneath it says
+    /// "No problems detected", and the user is left to decide which half to believe.
+    #[test]
+    fn the_header_never_claims_worse_than_the_diagnosis_can_explain() {
+        let mut cfg = Config::default();
+        cfg.thresholds.trip_after_secs = 0.0;
+        cfg.thresholds.clear_after_secs = 0.0;
+        let now = Utc.with_ymd_and_hms(2026, 7, 20, 12, 0, 0).unwrap();
+
+        let faults: Vec<(&str, Vec<Sample>)> = vec![
+            (
+                "one endpoint unreachable while the others answer",
+                vec![
+                    Sample::Reachability {
+                        endpoint: "https".into(),
+                        ok: true,
+                    },
+                    Sample::Reachability {
+                        endpoint: "ipv6".into(),
+                        ok: false,
+                    },
+                ],
+            ),
+            (
+                "a port that will not open",
+                vec![Sample::TcpHandshake {
+                    endpoint: "cloudflare".into(),
+                    connect_ms: None,
+                }],
+            ),
+            (
+                "a negotiation that never completes",
+                vec![Sample::Tls {
+                    endpoint: "cloudflare".into(),
+                    handshake_ms: None,
+                    expires_in_days: None,
+                }],
+            ),
+            (
+                "a certificate about to expire",
+                vec![Sample::Tls {
+                    endpoint: "cloudflare".into(),
+                    handshake_ms: Some(20.0),
+                    expires_in_days: Some(1),
+                }],
+            ),
+        ];
+
+        for (what, samples) in faults {
+            let mut state = AppState::new(cfg.clone());
+            for sample in samples {
+                state.apply_sample(now, sample);
+            }
+            let worst = diagnose(&state)
+                .iter()
+                .map(|d| d.severity)
+                .max()
+                .expect("diagnose is never empty");
+            assert_eq!(
+                worst,
+                state.overall_health(),
+                "the header and the diagnosis disagree about {what}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_refused_handshake_is_explained_rather_than_left_to_the_header() {
+        let s = Signals {
+            transport: Health::Crit,
+            transport_failed: vec!["cloudflare".into()],
+            ..healthy()
+        };
+        let t = top(&s);
+        assert_eq!(t.layer, Some(Layer::Isp));
+        assert_eq!(t.severity, Health::Crit);
+        assert!(
+            t.evidence.iter().any(|e| e.contains("cloudflare")),
+            "the verdict should name what failed: {t:?}"
+        );
+    }
+
+    #[test]
+    fn an_expiring_certificate_is_reported_without_blaming_the_network() {
+        let s = Signals {
+            cert: Health::Warn,
+            cert_soonest: Some(("cloudflare".into(), 9)),
+            ..healthy()
+        };
+        let t = top(&s);
+        assert_eq!(
+            t.layer, None,
+            "nothing on the path is broken, so no layer is at fault"
+        );
+        assert_eq!(t.severity, Health::Warn);
+        assert!(t.headline.to_lowercase().contains("certificate"), "{t:?}");
+    }
+
+    #[test]
+    fn one_dead_endpoint_among_several_is_not_an_outage() {
+        let s = Signals {
+            reach_bad: 1,
+            reach_total: 3,
+            ..healthy()
+        };
+        let t = top(&s);
+        assert_eq!(
+            t.layer,
+            Some(Layer::Remote),
+            "the rest of the connection works, so this is one host's problem"
+        );
+        assert!(
+            !t.headline.to_lowercase().contains("outage"),
+            "{}",
+            t.headline
+        );
     }
 
     #[test]

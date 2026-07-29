@@ -39,6 +39,12 @@ Keep pure logic separable from I/O so it stays unit-testable. Test I/O parsers a
 in-code fixtures; mark tests that need real network/sockets `#[ignore]` (they run under
 `cargo test -- --ignored`).
 
+The live `#[ignore]` tier has two halves. Per-module ones live beside the code they exercise
+(one real socket, one probe). Cross-cutting ones live in `tests/live.rs` and assert the whole
+path — probe → `Sample` → reducer → health. Two rules there: never assert on network
+*quality* (a test needing low latency fails on a train), and skip absent capability rather
+than failing it (no IPv6, no Wi-Fi card — both are correct configurations).
+
 ## Architecture
 
 Async (tokio), single-owner state, Elm-style reducer. It is a **lib + bin**: `main.rs` is
@@ -68,7 +74,13 @@ probe tasks ── mpsc<Sample> ──▶ AppState (reducer) ──▶ ratatui r
 - **`metrics/`** — one module per probe, each implementing the `Probe` trait
   (`async tick() -> Vec<Sample>`) in `metrics/mod.rs`, plus the `Sample` enum and `MetricId`.
   Ping uses **unprivileged ICMP** (`surge-ping` with `sock_type_hint = Type::DGRAM`; no root
-  on macOS). WiFi/routing/gateway detection shell out and are split into a **pure parser**
+  on macOS) and is dual-stack: `pingable_targets` drops v6 targets on a host with no v6 route
+  rather than pinging them into timeouts, and `AppState::retain_targets` then drops their rows
+  (an empty series renders as a flawless `0ms / 0% loss`). `metrics::reachability`
+  applies the same policy via `checkable_endpoints`. `tcp`/`tls` time a handshake apiece —
+  what a real connection waits on that ICMP never sees — and `tls` also reads the leaf
+  certificate's expiry off the completed handshake. WiFi/routing/gateway detection shell out
+  and are split into a **pure parser**
   (unit-tested against fixtures: `parse_airport`, `parse_traceroute`, `net::parse_default_gateway`)
   and a thin subprocess wrapper. `FakeProbe` replays scripted samples for tests.
 - **`ui/`** — `theme.rs` (the `Theme` palette struct + the health→border-style contract, a
@@ -78,6 +90,10 @@ probe tasks ── mpsc<Sample> ──▶ AppState (reducer) ──▶ ratatui r
   renderable in isolation), and the composed `render`. The active `Theme` lives on
   `AppState.theme` (resolved from `config.ui.theme`, cycled live by the `t` key →
   `Action::CycleTheme`).
+- **`diagnosis.rs`** — the correlation ruleset. `AppState` is projected into a pure `Signals`
+  snapshot, `diagnose_signals` reasons over it, and `primary_layer` is a *reading* of that
+  list rather than a second ruleset (two engines disagree, and then the panel and the event
+  feed tell the user different stories about one outage).
 - **`config.rs`** — complete built-in defaults; TOML load where any omitted field falls back
   to its default (`#[serde(default)]` on every container). `incidents.rs` — JSONL log written
   through an injectable `Write` sink.
@@ -93,5 +109,11 @@ probe tasks ── mpsc<Sample> ──▶ AppState (reducer) ──▶ ratatui r
 - Adding a new metric touches several places in lockstep: `Sample` variant (`metrics/mod.rs`),
   a reducer arm + state + `panel_health` (`app.rs`), a `MetricId`, a probe module, a panel,
   and wiring in `event::run_inner`.
+- **If the new metric joins `overall_health`, it needs a `diagnosis.rs` rule too.** Otherwise
+  the header banner says PROBLEM while the DIAGNOSIS panel below it says "No problems
+  detected" — `the_header_never_claims_worse_than_the_diagnosis_can_explain` enforces this.
+- An absent capability is not a fault. IPv6 on a v4-only host is the standing example: drop
+  the probe target rather than reporting 100% loss, which is the loudest possible way to say
+  "this is normal".
 - Incident log path (macOS): `~/Library/Application Support/network_dash/incidents.jsonl`.
 - Keep probes lightweight (no active bandwidth flooding); that is a hard requirement.
