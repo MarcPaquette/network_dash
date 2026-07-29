@@ -47,6 +47,10 @@ pub enum Action {
 #[derive(Debug, Clone)]
 pub struct TargetState {
     pub is_gateway: bool,
+    /// The address this target was registered under. Kept so the state can answer questions
+    /// about itself (family, display label) without the caller re-deriving them from the
+    /// map key it happens to be filed under.
+    addr: String,
     pub latency_ms: Series,
     pub loss: LossWindow,
     /// Rolling history of the loss-window percentage, for the loss line graph.
@@ -57,16 +61,42 @@ pub struct TargetState {
 }
 
 impl TargetState {
-    fn new(is_gateway: bool, cfg: &Config) -> Self {
+    fn new(addr: String, is_gateway: bool, cfg: &Config) -> Self {
         let t = &cfg.thresholds;
         Self {
             is_gateway,
+            addr,
             latency_ms: Series::new(t.history_len),
             loss: LossWindow::new(t.loss_window),
             loss_history: Series::new(t.history_len),
             latency_health: Debouncer::new(Health::Ok, t.trip_after(), t.clear_after()),
             jitter_health: Debouncer::new(Health::Ok, t.trip_after(), t.clear_after()),
             loss_health: Debouncer::new(Health::Ok, t.trip_after(), t.clear_after()),
+        }
+    }
+
+    /// Whether this target is pinged over IPv6.
+    pub fn is_ipv6(&self) -> bool {
+        self.addr
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_ipv6())
+    }
+
+    /// The address, shortened if it cannot fit the panel's 15-wide name column.
+    ///
+    /// v6 literals routinely run past 20 characters, and the middle groups are the part
+    /// nobody reads: the prefix says whose network it is and the last group says which host.
+    /// Elided from the middle so both ends survive.
+    pub fn label(&self) -> String {
+        const WIDTH: usize = 15;
+        if self.addr.chars().count() <= WIDTH {
+            return self.addr.clone();
+        }
+        match (self.addr.split_once(':'), self.addr.rsplit_once(':')) {
+            (Some((head, _)), Some((_, tail))) => format!("{head}:…:{tail}"),
+            // Not a v6 literal (a long hostname, say) — truncate from the right, where the
+            // distinguishing part of a name usually isn't.
+            _ => self.addr.chars().take(WIDTH - 1).chain(['…']).collect(),
         }
     }
 
@@ -330,10 +360,21 @@ impl AppState {
     /// Register (or re-flag) a ping target. Used at startup and after gateway detection.
     pub fn register_target(&mut self, addr: impl Into<String>, is_gateway: bool) {
         let cfg = self.config.clone();
+        let addr = addr.into();
         self.targets
-            .entry(addr.into())
-            .or_insert_with(|| TargetState::new(is_gateway, &cfg))
+            .entry(addr.clone())
+            .or_insert_with(|| TargetState::new(addr, is_gateway, &cfg))
             .is_gateway = is_gateway;
+    }
+
+    /// Drop every ping target not in `keep`.
+    ///
+    /// Called once the ping probe has decided what it can actually reach — on a v4-only host
+    /// the configured IPv6 targets are never pinged, and a target with no samples renders as
+    /// a flawless `0ms / 0% loss`. Silence that reads as perfect health is worse than no row
+    /// at all.
+    pub fn retain_targets(&mut self, keep: &[String]) {
+        self.targets.retain(|name, _| keep.contains(name));
     }
 
     /// Fold one sample into state, returning any incidents produced by the update. Emitted
@@ -2104,6 +2145,53 @@ mod tests {
         assert_eq!(cleared.len(), 1, "{cleared:#?}");
         assert_eq!(cleared[0].severity, Health::Ok);
         assert!(!s.captive_portal);
+    }
+
+    // --- dual-stack ---
+
+    #[test]
+    fn a_v6_target_is_recognised_as_one() {
+        let mut s = AppState::new(test_config());
+        s.register_target("2606:4700:4700::1111", false);
+        s.register_target("1.1.1.1", false);
+        assert!(s.targets["2606:4700:4700::1111"].is_ipv6());
+        assert!(!s.targets["1.1.1.1"].is_ipv6());
+    }
+
+    #[test]
+    fn a_v6_address_is_shortened_to_fit_the_name_column() {
+        let mut s = AppState::new(test_config());
+        s.register_target("2606:4700:4700::1111", false);
+        let label = s.targets["2606:4700:4700::1111"].label();
+        assert!(
+            label.chars().count() <= 15,
+            "the panel's name column is 15 wide: {label:?}"
+        );
+        assert!(
+            label.starts_with("2606") && label.ends_with("1111"),
+            "both ends identify the address; the middle is the part nobody reads: {label:?}"
+        );
+    }
+
+    #[test]
+    fn a_v4_address_is_left_exactly_as_it_is() {
+        let mut s = AppState::new(test_config());
+        s.register_target("192.168.1.1", false);
+        assert_eq!(s.targets["192.168.1.1"].label(), "192.168.1.1");
+    }
+
+    #[test]
+    fn a_target_nothing_will_ever_ping_is_dropped_rather_than_shown_as_healthy() {
+        let mut s = AppState::new(test_config());
+        s.register_target("1.1.1.1", false);
+        s.register_target("2606:4700:4700::1111", false);
+        s.retain_targets(&["1.1.1.1".to_string()]);
+        assert!(s.targets.contains_key("1.1.1.1"));
+        assert!(
+            !s.targets.contains_key("2606:4700:4700::1111"),
+            "an unpingable target has an empty series, which renders as a perfect 0ms/0% \
+             — the most misleading thing the panel could say"
+        );
     }
 
     // --- tcp handshake ---

@@ -170,6 +170,9 @@ pub async fn run_once(config: Config) -> color_eyre::Result<()> {
 
     let mut samples = Vec::new();
     if let Ok(mut p) = crate::metrics::ping::PingProbe::new(&targets, Duration::from_millis(900)) {
+        // Whatever the probe won't ping (IPv6 targets on a v4-only host) leaves state now,
+        // before it can occupy a row reporting a flawless 0ms.
+        state.retain_targets(&p.target_names());
         samples.extend(p.tick().await);
     }
     let mut dns = crate::metrics::dns::DnsProbe::new(&config.resolvers, Duration::from_secs(2));
@@ -297,6 +300,7 @@ async fn run_inner(terminal: &mut crate::tui::Tui, config: Config) -> color_eyre
     let mut handles = Vec::new();
     match crate::metrics::ping::PingProbe::new(&targets, timeout) {
         Ok(probe) if probe.target_count() > 0 => {
+            state.retain_targets(&probe.target_names());
             handles.push(spawn_probe(probe, interval, tx.clone(), &wake));
         }
         _ => handles.push(spawn_probe(

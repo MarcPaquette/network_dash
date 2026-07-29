@@ -477,7 +477,7 @@ pub fn latency(frame: &mut Frame, area: Rect, state: &AppState) {
         .targets
         .iter()
         .enumerate()
-        .map(|(i, (name, t))| {
+        .map(|(i, (_, t))| {
             let cur = t.latency_ms.latest().unwrap_or(0.0);
             let avg = t.latency_ms.mean().unwrap_or(0.0);
             let p95 = t.latency_ms.p95().unwrap_or(0.0);
@@ -485,7 +485,7 @@ pub fn latency(frame: &mut Frame, area: Rect, state: &AppState) {
             let jit = t.latency_ms.jitter().unwrap_or(0.0);
             ListItem::new(Line::from(vec![
                 Span::styled(
-                    format!("{name:<15} "),
+                    format!("{:<15} ", t.label()),
                     Style::default().fg(state.theme.series_color(i)),
                 ),
                 Span::styled(
@@ -556,12 +556,12 @@ pub fn loss(frame: &mut Frame, area: Rect, state: &AppState) {
 
     let items: Vec<ListItem> = state
         .targets
-        .iter()
-        .map(|(name, t)| {
+        .values()
+        .map(|t| {
             let pct = t.loss.loss_pct();
             let color = state.theme.health_color(t.loss_health_current());
             ListItem::new(Line::from(vec![
-                Span::raw(format!("{name:<16} ")),
+                Span::raw(format!("{:<16} ", t.label())),
                 Span::styled(format!("{pct:>5.1}%"), Style::default().fg(color)),
             ]))
         })
@@ -1757,6 +1757,34 @@ mod tests {
                 connect_ms,
             },
         );
+    }
+
+    #[test]
+    fn a_v6_target_does_not_shove_the_latency_columns_out_of_line() {
+        let mut state = test_state();
+        state.register_target("2606:4700:4700::1111", false);
+        state.register_target("1.1.1.1", false);
+        let mut term = Terminal::new(TestBackend::new(80, 8)).unwrap();
+        term.draw(|f| latency(f, f.area(), &state)).unwrap();
+        let text = buffer_text(&term);
+        assert!(
+            text.contains("2606:…:1111"),
+            "the address is elided, not truncated to nothing: {text}"
+        );
+        // Both rows must put "avg" in the same column; a wide name would push one right.
+        let cols: Vec<_> = text
+            .lines()
+            .filter(|l| l.contains("avg"))
+            // Char index, not byte offset: the elided name contains a multi-byte "…", and
+            // the question here is where the column lands on screen.
+            .map(|l| {
+                l.char_indices()
+                    .position(|(i, _)| l[i..].starts_with("avg"))
+                    .unwrap()
+            })
+            .collect();
+        assert_eq!(cols.len(), 2, "both targets are listed: {text}");
+        assert_eq!(cols[0], cols[1], "the columns stay aligned: {text}");
     }
 
     #[test]

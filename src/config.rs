@@ -51,6 +51,10 @@ pub struct Targets {
     /// Manual gateway override (used when `gateway_auto` is false or detection fails).
     pub gateway: Option<String>,
     /// Internet hosts pinged for latency/loss (e.g. `1.1.1.1`, `8.8.8.8`).
+    ///
+    /// IPv6 literals belong here alongside the v4 ones: the probe drops them on a host with
+    /// no v6 route rather than reporting them as loss, so listing them costs nothing on a
+    /// v4-only network and shows both stacks on a dual-stack one.
     pub internet: Vec<String>,
     /// Stable target for the routing / traceroute probe.
     pub routing_target: String,
@@ -64,7 +68,14 @@ impl Default for Targets {
         Self {
             gateway_auto: true,
             gateway: None,
-            internet: vec!["1.1.1.1".to_string(), "8.8.8.8".to_string()],
+            internet: vec![
+                "1.1.1.1".to_string(),
+                "8.8.8.8".to_string(),
+                // The v6 side of the same two operators, so a difference between the stacks
+                // is a difference in the path and not in who is at the far end of it.
+                "2606:4700:4700::1111".to_string(),
+                "2001:4860:4860::8888".to_string(),
+            ],
             routing_target: "1.1.1.1".to_string(),
             max_hops: 15,
         }
