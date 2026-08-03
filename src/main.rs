@@ -35,6 +35,14 @@ async fn main() -> color_eyre::Result<()> {
         None => Config::default(),
     };
 
+    // Before the alternate screen swallows stderr: tell the user which keys in their file
+    // are no longer doing anything.
+    if let Some(p) = &path {
+        for line in config.deprecation_warnings(p) {
+            eprintln!("{line}");
+        }
+    }
+
     if cli.print_config {
         println!("{}", config.to_toml_string()?);
         return Ok(());

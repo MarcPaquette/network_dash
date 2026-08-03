@@ -48,6 +48,12 @@ impl<T> RingBuffer<T> {
         self.buf.back()
     }
 
+    /// Mutable access to the most recently pushed element, for buffers whose newest slot
+    /// accumulates (e.g. the worst health seen so far in the current minute).
+    pub fn latest_mut(&mut self) -> Option<&mut T> {
+        self.buf.back_mut()
+    }
+
     /// Iterate oldest → newest.
     pub fn iter(&self) -> impl Iterator<Item = &T> {
         self.buf.iter()
@@ -184,6 +190,22 @@ mod tests {
     fn ring_new_caps_minimum_one() {
         let rb: RingBuffer<i32> = RingBuffer::new(0);
         assert_eq!(rb.capacity(), 1);
+    }
+
+    #[test]
+    fn ring_latest_mut_updates_the_newest_slot_in_place() {
+        let mut rb = RingBuffer::new(3);
+        rb.push(1);
+        rb.push(2);
+        *rb.latest_mut().unwrap() = 9;
+        assert_eq!(rb.iter().copied().collect::<Vec<_>>(), vec![1, 9]);
+        assert_eq!(rb.len(), 2, "mutating must not append");
+    }
+
+    #[test]
+    fn ring_latest_mut_is_none_when_empty() {
+        let mut rb: RingBuffer<i32> = RingBuffer::new(3);
+        assert!(rb.latest_mut().is_none());
     }
 
     #[test]

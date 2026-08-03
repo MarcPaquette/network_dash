@@ -9,16 +9,19 @@ use std::future::Future;
 use serde::{Deserialize, Serialize};
 
 pub mod dns;
+pub mod iface;
 pub mod link;
 pub mod ping;
 pub mod proc;
 pub mod pubip;
 pub mod reachability;
 pub mod routing;
+pub mod tcp;
 pub mod throughput;
+pub mod tls;
 
 /// Stable identifier for each dashboard section / metric family.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MetricId {
     Latency,
@@ -26,8 +29,26 @@ pub enum MetricId {
     Jitter,
     Dns,
     Routing,
+    /// Capacity — how much the link can carry.
     Throughput,
+    /// Latency added under load. Drawn in the throughput panel, but a distinct fault with a
+    /// distinct fix, so it is logged and correlated under its own name.
+    Bufferbloat,
+    /// Frames the local NIC failed to send or receive — a hardware fault, not a network one.
+    InterfaceErrors,
     Reachability,
+    /// Time to complete a TCP handshake — reachability plus everything a real connection
+    /// waits on that ICMP never sees.
+    TcpHandshake,
+    /// Time to negotiate TLS on top of an open connection.
+    TlsHandshake,
+    /// How long the presented certificate has left. Not a network fault at all — nothing is
+    /// slow and nothing is down — but on a known date everything stops.
+    CertExpiry,
+    /// Web traffic is being intercepted and a sign-in is required.
+    CaptivePortal,
+    /// The WAN-side address changed — an event rather than a fault (see [`MetricId::label`]).
+    PublicIp,
     Link,
     /// The dashboard reporting on itself — currently only "the incident log is unwritable".
     Log,
@@ -43,7 +64,14 @@ impl MetricId {
             MetricId::Dns => "dns",
             MetricId::Routing => "routing",
             MetricId::Throughput => "throughput",
+            MetricId::Bufferbloat => "bufferbloat",
+            MetricId::InterfaceErrors => "interface errors",
             MetricId::Reachability => "reachability",
+            MetricId::TcpHandshake => "tcp",
+            MetricId::TlsHandshake => "tls",
+            MetricId::CertExpiry => "cert expiry",
+            MetricId::CaptivePortal => "captive portal",
+            MetricId::PublicIp => "public ip",
             MetricId::Link => "link",
             MetricId::Log => "log",
         }
@@ -61,12 +89,28 @@ pub enum Sample {
         resolver: String,
         latency_ms: Option<f64>,
     },
+    /// Whether a resolver is answering for names it has no business answering for.
+    DnsIntegrity { resolver: String, hijacked: bool },
     /// Passive throughput reading in bytes/sec.
     Throughput { rx_bps: f64, tx_bps: f64 },
     /// Active capacity-probe result in Mbps.
     ThroughputProbe { mbps: f64 },
     /// Latency measured while idle vs while the link is saturated (bufferbloat), in ms.
     Bufferbloat { idle_ms: f64, loaded_ms: f64 },
+    /// Frames the local NIC failed to receive/transmit since the previous reading.
+    InterfaceErrors { rx_errors: u64, tx_errors: u64 },
+    /// Time to complete a TCP handshake. `connect_ms == None` means the port never opened.
+    TcpHandshake {
+        endpoint: String,
+        connect_ms: Option<f64>,
+    },
+    /// TLS negotiation time and how long the presented certificate has left. Either is
+    /// `None` when the handshake did not complete — which is itself the finding.
+    Tls {
+        endpoint: String,
+        handshake_ms: Option<f64>,
+        expires_in_days: Option<i64>,
+    },
     /// Reachability check for a named endpoint.
     Reachability { endpoint: String, ok: bool },
     /// Captive-portal detection result (a login page intercepting web traffic).

@@ -170,19 +170,51 @@ pub async fn run_once(config: Config) -> color_eyre::Result<()> {
 
     let mut samples = Vec::new();
     if let Ok(mut p) = crate::metrics::ping::PingProbe::new(&targets, Duration::from_millis(900)) {
+        // Whatever the probe won't ping (IPv6 targets on a v4-only host) leaves state now,
+        // before it can occupy a row reporting a flawless 0ms.
+        state.retain_targets(&p.target_names());
         samples.extend(p.tick().await);
     }
     let mut dns = crate::metrics::dns::DnsProbe::new(&config.resolvers, Duration::from_secs(2));
     samples.extend(dns.tick().await);
+    samples.extend(
+        crate::metrics::dns::DnsIntegrityProbe::with_clock_seed(
+            &config.resolvers,
+            Duration::from_secs(2),
+        )
+        .tick()
+        .await,
+    );
     let mut reach = crate::metrics::reachability::ReachabilityProbe::new(
-        crate::metrics::reachability::ReachabilityProbe::default_endpoints(),
+        crate::metrics::reachability::checkable_endpoints(
+            crate::metrics::reachability::ReachabilityProbe::default_endpoints(),
+            crate::metrics::ping::has_ipv6_route(),
+        ),
     );
     samples.extend(reach.tick().await);
     samples.extend(crate::metrics::link::WifiProbe.tick().await);
+    samples.extend(crate::metrics::iface::InterfaceProbe::new().tick().await);
     samples.extend(
-        crate::metrics::routing::RoutingProbe::new(config.targets.routing_target.clone(), 15)
-            .tick()
-            .await,
+        crate::metrics::tcp::TcpProbe::new(
+            crate::metrics::tcp::TcpProbe::default_endpoints(),
+            Duration::from_secs(3),
+        )
+        .tick()
+        .await,
+    );
+    if let Some(mut tls) = crate::metrics::tls::TlsProbe::new(
+        crate::metrics::tls::TlsProbe::default_endpoints(),
+        Duration::from_secs(5),
+    ) {
+        samples.extend(tls.tick().await);
+    }
+    samples.extend(
+        crate::metrics::routing::RoutingProbe::new(
+            config.targets.routing_target.clone(),
+            config.targets.max_hops,
+        )
+        .tick()
+        .await,
     );
 
     let now = chrono::Utc::now();
@@ -210,8 +242,37 @@ pub async fn run_once(config: Config) -> color_eyre::Result<()> {
         MetricId::Routing,
         MetricId::Throughput,
         MetricId::Link,
+        MetricId::TcpHandshake,
     ] {
-        println!("  {:<12} {}", m.label(), badge(state.panel_health(m)));
+        println!("  {:<16} {}", m.label(), badge(state.panel_health(m)));
+    }
+    if let (Some(rx), Some(tx)) = (state.iface.rx_errors, state.iface.tx_errors) {
+        println!(
+            "  {:<16} {}  ({rx} rx, {tx} tx)",
+            MetricId::InterfaceErrors.label(),
+            badge(state.iface.health_current())
+        );
+    }
+    for (name, ep) in &state.tcp {
+        let v = if ep.last_ok {
+            format!("{:.0}ms", ep.connect_ms.latest().unwrap_or(0.0))
+        } else {
+            "REFUSED".into()
+        };
+        println!("  tcp  {name:<16} {v}");
+    }
+    for (name, ep) in &state.tls {
+        let v = if ep.last_ok {
+            format!("{:.0}ms", ep.handshake_ms.latest().unwrap_or(0.0))
+        } else {
+            "FAILED".into()
+        };
+        let cert = match ep.expires_in_days {
+            Some(d) if d < 0 => format!("cert EXPIRED {}d ago", -d),
+            Some(d) => format!("cert {d}d left"),
+            None => "cert —".into(),
+        };
+        println!("  tls  {name:<16} {v:<8} {cert}");
     }
     for (name, t) in &state.targets {
         println!(
@@ -226,7 +287,8 @@ pub async fn run_once(config: Config) -> color_eyre::Result<()> {
         } else {
             "FAIL".into()
         };
-        println!("  dns  {name:<16} {v}");
+        let integrity = if r.hijacked { "  HIJACK" } else { "" };
+        println!("  dns  {name:<16} {v}{integrity}");
     }
     Ok(())
 }
@@ -269,6 +331,7 @@ async fn run_inner(terminal: &mut crate::tui::Tui, config: Config) -> color_eyre
     let mut handles = Vec::new();
     match crate::metrics::ping::PingProbe::new(&targets, timeout) {
         Ok(probe) if probe.target_count() > 0 => {
+            state.retain_targets(&probe.target_names());
             handles.push(spawn_probe(probe, interval, tx.clone(), &wake));
         }
         _ => handles.push(spawn_probe(
@@ -291,18 +354,68 @@ async fn run_inner(terminal: &mut crate::tui::Tui, config: Config) -> color_eyre
     // HTTP(S) reachability + captive/IPv6.
     handles.push(spawn_probe(
         crate::metrics::reachability::ReachabilityProbe::new(
-            crate::metrics::reachability::ReachabilityProbe::default_endpoints(),
+            crate::metrics::reachability::checkable_endpoints(
+                crate::metrics::reachability::ReachabilityProbe::default_endpoints(),
+                crate::metrics::ping::has_ipv6_route(),
+            ),
         ),
         Duration::from_millis(config.cadence.reachability_ms),
         tx.clone(),
         &wake,
     ));
 
-    // Passive throughput counters.
-    let tput_interval = Duration::from_millis(config.cadence.throughput_passive_ms);
+    // Local NIC error counters — free, and the only probe that can blame your own hardware.
     handles.push(spawn_probe(
-        crate::metrics::throughput::ThroughputProbe::new(tput_interval),
-        tput_interval,
+        crate::metrics::iface::InterfaceProbe::new(),
+        Duration::from_millis(config.cadence.interface_ms),
+        tx.clone(),
+        &wake,
+    ));
+
+    // Is the resolver answering honestly? A different question from how fast it answers,
+    // asked far less often, because a hijack is a configuration and not a condition.
+    handles.push(spawn_probe(
+        crate::metrics::dns::DnsIntegrityProbe::with_clock_seed(
+            &config.resolvers,
+            Duration::from_secs(2),
+        ),
+        Duration::from_millis(config.cadence.dns_integrity_ms),
+        tx.clone(),
+        &wake,
+    ));
+
+    // TCP handshake timing: what a real connection waits on, which ICMP cannot see. Slow
+    // cadence — it opens a connection on someone else's host, so it stays occasional.
+    handles.push(spawn_probe(
+        crate::metrics::tcp::TcpProbe::new(
+            crate::metrics::tcp::TcpProbe::default_endpoints(),
+            Duration::from_secs(3),
+        ),
+        Duration::from_millis(config.cadence.tcp_ms),
+        tx.clone(),
+        &wake,
+    ));
+
+    // TLS negotiation and certificate expiry. Skipped entirely if the platform trust store
+    // will not load: without it there is no verdict worth reporting, and a permissive
+    // fallback would call a bad certificate healthy.
+    if let Some(probe) = crate::metrics::tls::TlsProbe::new(
+        crate::metrics::tls::TlsProbe::default_endpoints(),
+        Duration::from_secs(5),
+    ) {
+        handles.push(spawn_probe(
+            probe,
+            Duration::from_millis(config.cadence.tls_ms),
+            tx.clone(),
+            &wake,
+        ));
+    }
+
+    // Passive throughput counters. The probe measures its own interval, so the cadence here
+    // only decides how often it is asked, not how the rate is scaled.
+    handles.push(spawn_probe(
+        crate::metrics::throughput::ThroughputProbe::new(),
+        Duration::from_millis(config.cadence.throughput_passive_ms),
         tx.clone(),
         &wake,
     ));
@@ -333,7 +446,10 @@ async fn run_inner(terminal: &mut crate::tui::Tui, config: Config) -> color_eyre
 
     // Routing / path (lightweight traceroute).
     handles.push(spawn_probe(
-        crate::metrics::routing::RoutingProbe::new(config.targets.routing_target.clone(), 15),
+        crate::metrics::routing::RoutingProbe::new(
+            config.targets.routing_target.clone(),
+            config.targets.max_hops,
+        ),
         Duration::from_millis(config.cadence.routing_ms),
         tx.clone(),
         &wake,
@@ -345,6 +461,10 @@ async fn run_inner(terminal: &mut crate::tui::Tui, config: Config) -> color_eyre
     loop {
         tokio::select! {
             _ = render_tick.tick() => {
+                // Advance the availability strip from the clock, not from samples: during a
+                // total outage no samples arrive at all, and a strip that stops moving is
+                // exactly the wrong thing to show when everything is down.
+                state.tick(Utc::now());
                 terminal.draw(|f| ui::render(f, &state))?;
             }
             maybe_event = reader.next() => {

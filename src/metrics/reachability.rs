@@ -40,6 +40,24 @@ impl ReachabilityProbe {
     }
 }
 
+/// The label of the IPv6-only endpoint. Its whole purpose is to prove IPv6 works, which is
+/// why it needs a name the family filter can recognise.
+pub const IPV6_LABEL: &str = "ipv6";
+
+/// The endpoints worth checking, given whether this host has IPv6 at all.
+///
+/// Pure, and separated from the probe, because it is the whole of the policy — the same one
+/// the ping probe applies to v6 targets. On a v4-only network the IPv6 endpoint failing
+/// proves nothing: it is the *expected* outcome of a correctly-working network. Reporting it
+/// as unreachable leaves every v4-only home network with a permanently red panel, which is
+/// the loudest possible way to say "this is normal".
+pub fn checkable_endpoints(endpoints: Vec<(String, String)>, ipv6: bool) -> Vec<(String, String)> {
+    endpoints
+        .into_iter()
+        .filter(|(label, _)| ipv6 || label != IPV6_LABEL)
+        .collect()
+}
+
 /// Whether the captive-portal probe reached the genuine internet or was intercepted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CaptiveOutcome {
@@ -119,6 +137,29 @@ impl Probe for ReachabilityProbe {
                 .flatten()
                 .collect()
         }
+    }
+}
+
+#[cfg(test)]
+mod ipv6_tests {
+    use super::*;
+    use pretty_assertions::assert_eq;
+
+    #[test]
+    fn a_host_with_ipv6_checks_the_ipv6_endpoint() {
+        let kept = checkable_endpoints(ReachabilityProbe::default_endpoints(), true);
+        assert_eq!(kept.len(), 3);
+        assert!(kept.iter().any(|(l, _)| l == IPV6_LABEL));
+    }
+
+    #[test]
+    fn a_host_without_ipv6_does_not_check_it() {
+        let kept = checkable_endpoints(ReachabilityProbe::default_endpoints(), false);
+        assert!(
+            !kept.iter().any(|(l, _)| l == IPV6_LABEL),
+            "an endpoint that cannot succeed must not be counted as a failure: {kept:?}"
+        );
+        assert_eq!(kept.len(), 2, "the v4 endpoints are untouched");
     }
 }
 
