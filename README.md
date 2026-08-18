@@ -7,6 +7,13 @@ link/reachability. Leave it running; when something feels off, glance at it. Eac
 and threshold breaches are written to an incident log so you can see what happened while
 you were away.
 
+![The NetPulse dashboard mid-incident, with the header, diagnosis and affected panel borders
+all red](network_dash.png)
+
+*Caught mid-incident: the gateway is adding latency, so the banner, the DIAGNOSIS line and the
+borders of every affected panel go red together — and the EVENTS feed at the bottom notes that
+the route change was already explained by the same gateway fault. Theme: `neon_sunset`.*
+
 Built for macOS (uses unprivileged ICMP and `system_profiler` for WiFi); the pure logic is
 cross-platform and the I/O is behind small wrappers.
 
