@@ -24,6 +24,7 @@ use std::time::Duration;
 use network_dash::app::AppState;
 use network_dash::config::Config;
 use network_dash::diagnosis::diagnose;
+use network_dash::metrics::dns::Answer;
 use network_dash::metrics::{Probe, Sample};
 use pretty_assertions::assert_eq;
 
@@ -145,7 +146,7 @@ async fn public_resolvers_answer_and_the_dashboard_records_them() {
         samples.iter().any(|s| matches!(
             s,
             Sample::Dns {
-                latency_ms: Some(_),
+                answer: Answer::Addresses(_),
                 ..
             }
         )),
@@ -158,7 +159,7 @@ async fn public_resolvers_answer_and_the_dashboard_records_them() {
         state.apply_sample(now, s);
     }
     assert!(
-        state.resolvers.values().any(|r| r.last_ok),
+        state.resolvers.values().any(|r| r.last_ok()),
         "a successful lookup must reach the DNS panel"
     );
 }

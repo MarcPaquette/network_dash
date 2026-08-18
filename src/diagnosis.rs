@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::app::AppState;
 use crate::health::Health;
+use crate::metrics::dns::Integrity;
 
 /// The network segment a fault localizes to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -94,6 +95,14 @@ struct Signals {
     dns_system: Option<Health>,
     /// Worst health across the public resolvers (everything but "system").
     dns_public: Health,
+    /// Worst *honesty* verdict across resolvers, and who earned it. Kept apart from the two
+    /// above because a resolver being spoofed is fast and answers promptly — its timing is
+    /// spotless, and reading only the timing is how the fault stayed invisible here.
+    dns_integrity: Health,
+    /// Resolvers something else is answering for, and resolvers answering for names they do
+    /// not own. Different culprits, so the verdict names them separately.
+    dns_forged: Vec<String>,
+    dns_hijacked: Vec<String>,
     /// Any reachability endpoint currently OK / all of them failing.
     reach_any_ok: bool,
     reach_all_fail: bool,
@@ -141,6 +150,9 @@ impl Default for Signals {
             worst_internet_host: None,
             dns_system: Some(Health::Ok),
             dns_public: Health::Ok,
+            dns_integrity: Health::Ok,
+            dns_forged: Vec::new(),
+            dns_hijacked: Vec::new(),
             reach_any_ok: true,
             reach_all_fail: false,
             reach_total: 2,
@@ -203,6 +215,26 @@ impl Signals {
                 .filter(|(name, _)| name.as_str() != "system")
                 .map(|(_, r)| r.health_current()),
         );
+
+        // Honesty, which the timing verdicts above cannot see. It reaches the DNS panel and
+        // therefore the header, so it has to reach the diagnosis too — otherwise the banner
+        // says PROBLEM while the panel below it says nothing is wrong.
+        let dns_integrity = Health::worst_of(
+            state
+                .resolvers
+                .values()
+                .map(|r| r.integrity_health_current()),
+        );
+        let named = |want: Integrity| -> Vec<String> {
+            state
+                .resolvers
+                .iter()
+                .filter(|(_, r)| r.integrity == want)
+                .map(|(name, _)| name.clone())
+                .collect()
+        };
+        let dns_forged = named(Integrity::Forged);
+        let dns_hijacked = named(Integrity::Hijacked);
 
         // Reachability endpoints.
         let mut reach_any_ok = false;
@@ -276,6 +308,9 @@ impl Signals {
             worst_internet_host,
             dns_system,
             dns_public,
+            dns_integrity,
+            dns_forged,
+            dns_hijacked,
             reach_any_ok,
             reach_all_fail,
             reach_total,
@@ -497,6 +532,35 @@ fn diagnose_signals(s: &Signals) -> Vec<Diagnosis> {
         }
     }
 
+    // 4a. DNS honesty. Reported regardless of connectivity, and separately from the timing
+    // rule above: interception is at its most convincing when everything else looks perfect,
+    // and a resolver being spoofed answers faster than the real one ever could.
+    if s.dns_integrity > Health::Ok {
+        let (headline, evidence) = if !s.dns_forged.is_empty() {
+            (
+                "Something on this network is answering DNS in place of your resolvers".to_string(),
+                vec![format!(
+                    "{} replied to nothing that must resolve — the answers are not theirs",
+                    s.dns_forged.join(", ")
+                )],
+            )
+        } else {
+            (
+                "A resolver is answering for names it does not own".to_string(),
+                vec![format!(
+                    "{} returns addresses for names that should not resolve",
+                    s.dns_hijacked.join(", ")
+                )],
+            )
+        };
+        out.push(Diagnosis {
+            layer: Some(Layer::Dns),
+            severity: s.dns_integrity,
+            headline,
+            evidence,
+        });
+    }
+
     // 4b. Transport. A host that answers ICMP can still refuse every connection, and a
     // handshake that succeeds slowly is invisible to every other probe on the dashboard.
     // Reported even when the ISP rules above fired, because "your ISP is degraded" does not
@@ -605,6 +669,7 @@ mod tests {
     use super::*;
     use crate::config::Config;
     use crate::metrics::Sample;
+    use crate::metrics::dns::Answer;
     use chrono::{DateTime, TimeZone, Utc};
     use pretty_assertions::assert_eq;
 
@@ -672,6 +737,20 @@ mod tests {
                     expires_in_days: Some(1),
                 }],
             ),
+            (
+                "a resolver answering for names it does not own",
+                vec![Sample::DnsIntegrity {
+                    resolver: "system".into(),
+                    verdict: Integrity::Hijacked,
+                }],
+            ),
+            (
+                "something on the network answering in a resolver's place",
+                vec![Sample::DnsIntegrity {
+                    resolver: "cloudflare".into(),
+                    verdict: Integrity::Forged,
+                }],
+            ),
         ];
 
         for (what, samples) in faults {
@@ -706,6 +785,57 @@ mod tests {
             t.evidence.iter().any(|e| e.contains("cloudflare")),
             "the verdict should name what failed: {t:?}"
         );
+    }
+
+    // Interception is most convincing when every other signal is perfect, so this rule must
+    // not be gated on something else already being wrong.
+    #[test]
+    fn a_forged_resolver_is_explained_on_an_otherwise_perfect_network() {
+        let s = Signals {
+            dns_integrity: Health::Warn,
+            dns_forged: vec!["cloudflare".into(), "google".into()],
+            ..healthy()
+        };
+        let t = top(&s);
+        assert_eq!(t.layer, Some(Layer::Dns));
+        assert_eq!(t.severity, Health::Warn);
+        assert!(
+            t.evidence.iter().any(|e| e.contains("cloudflare")),
+            "the verdict must name who is being answered for: {t:?}"
+        );
+        assert!(
+            t.headline.to_lowercase().contains("in place of"),
+            "a forgery is somebody else answering, not the resolver misbehaving: {t:?}"
+        );
+    }
+
+    #[test]
+    fn a_hijacking_resolver_is_blamed_rather_than_the_network() {
+        let s = Signals {
+            dns_integrity: Health::Warn,
+            dns_hijacked: vec!["system".into()],
+            ..healthy()
+        };
+        let t = top(&s);
+        assert_eq!(t.layer, Some(Layer::Dns));
+        assert!(
+            t.evidence.iter().any(|e| e.contains("system")),
+            "name the resolver that is answering: {t:?}"
+        );
+    }
+
+    // A resolver whose timing is spotless can still be the one being spoofed — that is the
+    // normal case, since the middlebox answers faster than the real resolver could.
+    #[test]
+    fn perfect_timing_does_not_clear_a_forged_resolver() {
+        let s = Signals {
+            dns_system: Some(Health::Ok),
+            dns_public: Health::Ok,
+            dns_integrity: Health::Warn,
+            dns_forged: vec!["cloudflare".into()],
+            ..healthy()
+        };
+        assert_eq!(top(&s).layer, Some(Layer::Dns));
     }
 
     #[test]
@@ -1082,21 +1212,21 @@ mod tests {
                 now(),
                 Sample::Dns {
                     resolver: "system".into(),
-                    latency_ms: None,
+                    answer: Answer::Silence,
                 },
             );
             state.apply_sample(
                 now(),
                 Sample::Dns {
                     resolver: "cloudflare".into(),
-                    latency_ms: Some(15.0),
+                    answer: Answer::Addresses(15.0),
                 },
             );
             state.apply_sample(
                 now(),
                 Sample::Dns {
                     resolver: "google".into(),
-                    latency_ms: Some(18.0),
+                    answer: Answer::Addresses(18.0),
                 },
             );
         }
