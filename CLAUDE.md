@@ -115,5 +115,13 @@ probe tasks ── mpsc<Sample> ──▶ AppState (reducer) ──▶ ratatui r
 - An absent capability is not a fault. IPv6 on a v4-only host is the standing example: drop
   the probe target rather than reporting 100% loss, which is the loudest possible way to say
   "this is normal".
+- **An empty answer is not a failed one.** DNS is the standing example: a resolver that
+  replies "I have nothing" (NODATA/NXDOMAIN) is *up*, and painting it the same red as one
+  that never replied is how an intercepted resolver got reported as unreachable. `dns::Answer`
+  keeps `Addresses`/`Empty`/`Silence` apart all the way to the panel, and interception is
+  reported as its own finding (`dns::Integrity`) rather than smuggled into the timing health.
+- Probe names must be **absolute** (trailing dot). A relative name picks up the OS search
+  list, so a "does not exist" control name can resolve via a search domain and read as a
+  hijack (`dns::absolute`).
 - Incident log path (macOS): `~/Library/Application Support/network_dash/incidents.jsonl`.
 - Keep probes lightweight (no active bandwidth flooding); that is a hard requirement.

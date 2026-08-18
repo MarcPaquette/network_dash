@@ -84,13 +84,18 @@ impl MetricId {
 pub enum Sample {
     /// One ICMP echo to a ping target. `rtt_ms == None` means the probe timed out (loss).
     Latency { target: String, rtt_ms: Option<f64> },
-    /// One DNS lookup. `latency_ms == None` means the lookup failed.
+    /// One DNS lookup, and what it did. An empty answer is not a failed one: the resolver
+    /// replied, so it is up — reporting it as down is how an intercepted resolver came to be
+    /// painted the same red as an unreachable one.
     Dns {
         resolver: String,
-        latency_ms: Option<f64>,
+        answer: dns::Answer,
     },
-    /// Whether a resolver is answering for names it has no business answering for.
-    DnsIntegrity { resolver: String, hijacked: bool },
+    /// Whether a resolver's answers were its own — and if not, in which direction.
+    DnsIntegrity {
+        resolver: String,
+        verdict: dns::Integrity,
+    },
     /// Passive throughput reading in bytes/sec.
     Throughput { rx_bps: f64, tx_bps: f64 },
     /// Active capacity-probe result in Mbps.

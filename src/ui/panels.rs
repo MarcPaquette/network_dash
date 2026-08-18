@@ -13,6 +13,7 @@ use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph};
 use crate::app::AppState;
 use crate::health::Health;
 use crate::metrics::MetricId;
+use crate::metrics::dns::{Answer, Integrity};
 use crate::ui::theme;
 use crate::ui::widgets::{LineSeries, line_chart, metric_block};
 
@@ -633,13 +634,16 @@ pub fn dns(frame: &mut Frame, area: Rect, state: &AppState) {
         .resolvers
         .iter()
         .map(|(name, r)| {
-            let (text, color) = if r.last_ok {
-                (
+            // Three states, not two. "EMPTY" is a resolver that replied with nothing —
+            // reachable, so not the red of an unreachable one, but useless, so not the green
+            // of a working one either. Which of those it was is the row beside it.
+            let (text, color) = match r.last_answer {
+                Answer::Addresses(_) => (
                     format!("{:.0}ms", r.latency_ms.latest().unwrap_or(0.0)),
                     state.theme.ok,
-                )
-            } else {
-                ("FAIL".to_string(), state.theme.crit)
+                ),
+                Answer::Empty(_) => ("EMPTY".to_string(), state.theme.warn),
+                Answer::Silence => ("FAIL".to_string(), state.theme.crit),
             };
             let mut spans = vec![
                 Span::raw(format!("{name:<12} ")),
@@ -647,9 +651,17 @@ pub fn dns(frame: &mut Frame, area: Rect, state: &AppState) {
             ];
             // Beside the timing, not instead of it: a hijacking resolver is usually a fast
             // one, and the speed on its own would read as a clean bill of health.
-            if r.hijacked {
+            // Name the direction: "HIJACK" is this resolver answering for names it does not
+            // own, "FORGED" is somebody else answering in its place. Different culprits,
+            // different fixes.
+            let label = match r.integrity {
+                Integrity::Honest => None,
+                Integrity::Hijacked => Some("  HIJACK"),
+                Integrity::Forged => Some("  FORGED"),
+            };
+            if let Some(label) = label {
                 spans.push(Span::styled(
-                    "  HIJACK",
+                    label,
                     Style::default().fg(state.theme.health_color(r.integrity_health_current())),
                 ));
             }
@@ -1229,7 +1241,7 @@ mod tests {
                 now,
                 Sample::Dns {
                     resolver: "system".into(),
-                    latency_ms: Some(ms),
+                    answer: Answer::Addresses(ms),
                 },
             );
         }
@@ -1511,21 +1523,21 @@ mod tests {
                 now,
                 Sample::Dns {
                     resolver: "system".into(),
-                    latency_ms: None,
+                    answer: Answer::Silence,
                 },
             );
             state.apply_sample(
                 now,
                 Sample::Dns {
                     resolver: "cloudflare".into(),
-                    latency_ms: Some(15.0),
+                    answer: Answer::Addresses(15.0),
                 },
             );
             state.apply_sample(
                 now,
                 Sample::Dns {
                     resolver: "google".into(),
-                    latency_ms: Some(18.0),
+                    answer: Answer::Addresses(18.0),
                 },
             );
         }
@@ -1789,14 +1801,14 @@ mod tests {
             Utc::now(),
             Sample::Dns {
                 resolver: "system".into(),
-                latency_ms: Some(12.0),
+                answer: Answer::Addresses(12.0),
             },
         );
         state.apply_sample(
             Utc::now(),
             Sample::DnsIntegrity {
                 resolver: "system".into(),
-                hijacked: true,
+                verdict: Integrity::Hijacked,
             },
         );
         let mut term = Terminal::new(TestBackend::new(80, 8)).unwrap();
@@ -1808,6 +1820,62 @@ mod tests {
         );
     }
 
+    // The row the whole fix exists for. A resolver that replied with nothing is reachable,
+    // so it must not wear the same crit red as one that never replied — and it must not read
+    // as working either.
+    #[test]
+    fn dns_panel_tells_an_empty_answer_apart_from_an_unreachable_resolver() {
+        let mut state = test_state();
+        state.apply_sample(
+            Utc::now(),
+            Sample::Dns {
+                resolver: "cloudflare".into(),
+                answer: Answer::Empty(4.0),
+            },
+        );
+        state.apply_sample(
+            Utc::now(),
+            Sample::Dns {
+                resolver: "system".into(),
+                answer: Answer::Silence,
+            },
+        );
+        let mut term = Terminal::new(TestBackend::new(80, 8)).unwrap();
+        term.draw(|f| dns(f, f.area(), &state)).unwrap();
+        let text = buffer_text(&term);
+        assert!(
+            text.contains("EMPTY"),
+            "an answered-with-nothing resolver must say so: {text}"
+        );
+        assert!(
+            text.contains("FAIL"),
+            "a resolver that never answered is still a FAIL: {text}"
+        );
+    }
+
+    #[test]
+    fn dns_panel_names_the_resolver_something_else_is_answering_for() {
+        let mut state = test_state();
+        state.apply_sample(
+            Utc::now(),
+            Sample::DnsIntegrity {
+                resolver: "cloudflare".into(),
+                verdict: Integrity::Forged,
+            },
+        );
+        let mut term = Terminal::new(TestBackend::new(80, 8)).unwrap();
+        term.draw(|f| dns(f, f.area(), &state)).unwrap();
+        let text = buffer_text(&term);
+        assert!(
+            text.contains("FORGED"),
+            "somebody answering in the resolver's place is not the resolver hijacking: {text}"
+        );
+        assert!(
+            !text.contains("HIJACK"),
+            "the two must not be confused, they have different culprits: {text}"
+        );
+    }
+
     #[test]
     fn dns_panel_stays_quiet_when_the_answers_are_honest() {
         let mut state = test_state();
@@ -1815,7 +1883,7 @@ mod tests {
             Utc::now(),
             Sample::DnsIntegrity {
                 resolver: "system".into(),
-                hijacked: false,
+                verdict: Integrity::Honest,
             },
         );
         let mut term = Terminal::new(TestBackend::new(80, 8)).unwrap();
@@ -2009,14 +2077,14 @@ mod tests {
             now,
             Sample::Dns {
                 resolver: "cloudflare".into(),
-                latency_ms: Some(19.0),
+                answer: Answer::Addresses(19.0),
             },
         );
         state.apply_sample(
             now,
             Sample::Dns {
                 resolver: "google".into(),
-                latency_ms: None,
+                answer: Answer::Silence,
             },
         );
         let mut term = Terminal::new(TestBackend::new(40, 8)).unwrap();
@@ -2244,7 +2312,7 @@ mod tests {
                 at,
                 Sample::Dns {
                     resolver: "system".into(),
-                    latency_ms: Some(14.0 + i as f64),
+                    answer: Answer::Addresses(14.0 + i as f64),
                 },
             );
             s.apply_sample(

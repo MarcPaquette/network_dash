@@ -17,6 +17,7 @@ use tokio::task::JoinHandle;
 use crate::app::{Action, AppState};
 use crate::config::Config;
 use crate::incidents::RotatingLog;
+use crate::metrics::dns::{Answer, Integrity};
 use crate::metrics::{Probe, Sample};
 use crate::ui;
 
@@ -282,12 +283,16 @@ pub async fn run_once(config: Config) -> color_eyre::Result<()> {
         );
     }
     for (name, r) in &state.resolvers {
-        let v = if r.last_ok {
-            format!("{:.0}ms", r.latency_ms.latest().unwrap_or(0.0))
-        } else {
-            "FAIL".into()
+        let v = match r.last_answer {
+            Answer::Addresses(_) => format!("{:.0}ms", r.latency_ms.latest().unwrap_or(0.0)),
+            Answer::Empty(_) => "EMPTY".into(),
+            Answer::Silence => "FAIL".into(),
         };
-        let integrity = if r.hijacked { "  HIJACK" } else { "" };
+        let integrity = match r.integrity {
+            Integrity::Honest => "",
+            Integrity::Hijacked => "  HIJACK",
+            Integrity::Forged => "  FORGED",
+        };
         println!("  dns  {name:<16} {v}{integrity}");
     }
     Ok(())

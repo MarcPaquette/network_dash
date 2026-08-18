@@ -15,6 +15,7 @@ use crate::diagnosis::Layer;
 use crate::health::{Debouncer, FlapDetector, Health, Thresholds};
 use crate::history::{LossWindow, RingBuffer, Series};
 use crate::incidents::Incident;
+use crate::metrics::dns::{Answer, Integrity};
 use crate::metrics::{Hop, MetricId, Sample};
 use crate::ui::theme::Theme;
 
@@ -122,10 +123,13 @@ impl TargetState {
 /// Per-DNS-resolver rolling state.
 #[derive(Debug, Clone)]
 pub struct ResolverState {
-    /// Whether this resolver was last seen answering for names it does not own.
-    pub hijacked: bool,
+    /// How honest this resolver's last answers looked.
+    pub integrity: Integrity,
     pub latency_ms: Series,
-    pub last_ok: bool,
+    /// What the most recent lookup did. Kept whole rather than reduced to a bool: "answered
+    /// with nothing" and "never answered" are different rows on the panel and different
+    /// faults, and flattening them is the bug this replaced.
+    pub last_answer: Answer,
     health: Debouncer,
     /// Honesty, debounced apart from timing: the two are different faults, and a resolver
     /// that answers quickly and wrongly must not have its speed excuse its answers.
@@ -136,12 +140,18 @@ impl ResolverState {
     fn new(cfg: &Config) -> Self {
         let t = &cfg.thresholds;
         Self {
-            hijacked: false,
+            integrity: Integrity::Honest,
             latency_ms: Series::new(t.history_len),
-            last_ok: true,
+            last_answer: Answer::Addresses(0.0),
             health: Debouncer::new(Health::Ok, t.trip_after(), t.clear_after()),
             integrity_health: Debouncer::new(Health::Ok, t.trip_after(), t.clear_after()),
         }
+    }
+
+    /// Whether the last lookup produced addresses. An empty answer is *not* ok for the
+    /// user's purposes, but it is not this resolver being unreachable either.
+    pub fn last_ok(&self) -> bool {
+        matches!(self.last_answer, Answer::Addresses(_))
     }
 
     /// Current debounced health of this resolver (read by the diagnosis engine).
@@ -447,12 +457,9 @@ impl AppState {
     pub fn apply_sample(&mut self, now: DateTime<Utc>, sample: Sample) -> Vec<Incident> {
         let mut incidents = match sample {
             Sample::Latency { target, rtt_ms } => self.apply_latency(now, &target, rtt_ms),
-            Sample::Dns {
-                resolver,
-                latency_ms,
-            } => self.apply_dns(now, &resolver, latency_ms),
-            Sample::DnsIntegrity { resolver, hijacked } => {
-                self.apply_dns_integrity(now, &resolver, hijacked)
+            Sample::Dns { resolver, answer } => self.apply_dns(now, &resolver, answer),
+            Sample::DnsIntegrity { resolver, verdict } => {
+                self.apply_dns_integrity(now, &resolver, verdict)
             }
             Sample::TcpHandshake {
                 endpoint,
@@ -791,30 +798,26 @@ impl AppState {
         out
     }
 
-    fn apply_dns(
-        &mut self,
-        now: DateTime<Utc>,
-        resolver: &str,
-        latency_ms: Option<f64>,
-    ) -> Vec<Incident> {
+    fn apply_dns(&mut self, now: DateTime<Utc>, resolver: &str, answer: Answer) -> Vec<Incident> {
         let cfg = self.config.clone();
         let thr = cfg.thresholds.dns;
         let state = self
             .resolvers
             .entry(resolver.to_string())
             .or_insert_with(|| ResolverState::new(&cfg));
-        let raw = match latency_ms {
-            Some(ms) => {
+        state.last_answer = answer;
+        let raw = match answer {
+            Answer::Addresses(ms) => {
                 state.latency_ms.push(ms);
-                state.last_ok = true;
                 thr.evaluate(ms)
             }
-            None => {
-                state.last_ok = false;
-                Health::Crit // a failed lookup is critical
-            }
+            // The resolver answered, so it is not down and this panel has no complaint. The
+            // emptiness itself is an honesty question, and the integrity debouncer beside
+            // this one is the thing that raises it.
+            Answer::Empty(_) => Health::Ok,
+            Answer::Silence => Health::Crit,
         };
-        let last_ok = state.last_ok;
+        let last_ok = state.last_ok();
         let latest = state.latency_ms.latest().unwrap_or(0.0);
         match state.health.update(now, raw) {
             Some(sev) if sev == Health::Ok => vec![status_incident(
@@ -1045,17 +1048,21 @@ impl AppState {
         &mut self,
         now: DateTime<Utc>,
         resolver: &str,
-        hijacked: bool,
+        verdict: Integrity,
     ) -> Vec<Incident> {
         let cfg = self.config.clone();
         let state = self
             .resolvers
             .entry(resolver.to_string())
             .or_insert_with(|| ResolverState::new(&cfg));
-        state.hijacked = hijacked;
-        // Warn, never Crit: the resolver is answering and names still resolve. What is wrong
-        // is who is answering, which is worth knowing and is not an outage.
-        let raw = if hijacked { Health::Warn } else { Health::Ok };
+        state.integrity = verdict;
+        // Warn, never Crit: something is wrong with *who is answering*, which is worth
+        // knowing and is not, on its own, an outage. A forged resolver is usually one of
+        // several configured, and the others still work.
+        let raw = match verdict {
+            Integrity::Honest => Health::Ok,
+            Integrity::Hijacked | Integrity::Forged => Health::Warn,
+        };
         match state.integrity_health.update(now, raw) {
             Some(Health::Ok) => vec![status_incident(
                 now,
@@ -1069,7 +1076,13 @@ impl AppState {
                 MetricId::Dns,
                 resolver,
                 sev,
-                format!("dns integrity: {resolver} answers for names it does not own"),
+                match verdict {
+                    Integrity::Forged => format!(
+                        "dns integrity: something on this network is answering in place of \
+                         {resolver}"
+                    ),
+                    _ => format!("dns integrity: {resolver} answers for names it does not own"),
+                },
             )],
             None => Vec::new(),
         }
@@ -2109,7 +2122,7 @@ mod tests {
     fn dns_timeout(resolver: &str) -> Sample {
         Sample::Dns {
             resolver: resolver.into(),
-            latency_ms: None,
+            answer: Answer::Silence,
         }
     }
 
@@ -2212,7 +2225,7 @@ mod tests {
                 c.tick(),
                 Sample::Dns {
                     resolver: "system".into(),
-                    latency_ms: Some(12.0),
+                    answer: Answer::Addresses(12.0),
                 },
             ));
         }
@@ -2443,12 +2456,77 @@ mod tests {
         );
     }
 
+    // --- an empty answer is not a dead resolver ---
+
+    fn dns_answer(resolver: &str, answer: Answer) -> Sample {
+        Sample::Dns {
+            resolver: resolver.into(),
+            answer,
+        }
+    }
+
+    // The bug the DNS panel was reported for: a middlebox intercepting UDP/53 replies with a
+    // well-formed empty answer in 4ms, and the resolver — up, reachable, answering — was
+    // painted the same crit red as one that was unplugged.
+    #[test]
+    fn a_resolver_that_answers_with_nothing_is_not_reported_as_unreachable() {
+        let mut s = AppState::new(test_config());
+        let mut c = Clock::new();
+        let out = drive(&mut s, &mut c, 6, || {
+            dns_answer("cloudflare", Answer::Empty(4.0))
+        });
+        assert!(
+            out.iter().all(|i| i.severity != Health::Crit),
+            "an empty answer is not an unreachable resolver: {out:#?}"
+        );
+        assert_eq!(
+            s.resolvers["cloudflare"].health_current(),
+            Health::Ok,
+            "the resolver replied, so the timing verdict has no complaint"
+        );
+        assert!(
+            !s.resolvers["cloudflare"].last_ok(),
+            "it is still not a usable answer"
+        );
+    }
+
+    // The other half of that: a resolver that genuinely never replies must still go crit.
+    // Fixing the false red must not cost the true one.
+    #[test]
+    fn a_resolver_that_never_replies_is_still_critical() {
+        let mut s = AppState::new(test_config());
+        let mut c = Clock::new();
+        let out = drive(&mut s, &mut c, 6, || {
+            dns_answer("cloudflare", Answer::Silence)
+        });
+        assert!(
+            out.iter().any(|i| i.severity == Health::Crit),
+            "silence from a resolver is still a failure: {out:#?}"
+        );
+        assert_eq!(s.resolvers["cloudflare"].health_current(), Health::Crit);
+    }
+
+    // An empty answer carries a latency, but it is not a resolution time — charting it would
+    // draw a fast, healthy-looking line for a resolver that resolved nothing.
+    #[test]
+    fn an_empty_answer_is_not_charted_as_a_resolution_time() {
+        let mut s = AppState::new(test_config());
+        let mut c = Clock::new();
+        s.apply_sample(c.tick(), dns_answer("cloudflare", Answer::Addresses(20.0)));
+        s.apply_sample(c.tick(), dns_answer("cloudflare", Answer::Empty(4.0)));
+        assert_eq!(
+            s.resolvers["cloudflare"].latency_ms.latest(),
+            Some(20.0),
+            "the 4ms empty reply must not enter the latency series"
+        );
+    }
+
     // --- dns integrity ---
 
-    fn integrity(resolver: &str, hijacked: bool) -> Sample {
+    fn integrity(resolver: &str, verdict: Integrity) -> Sample {
         Sample::DnsIntegrity {
             resolver: resolver.into(),
-            hijacked,
+            verdict,
         }
     }
 
@@ -2456,9 +2534,9 @@ mod tests {
     fn an_honest_resolver_is_not_remarked_upon() {
         let mut s = AppState::new(test_config());
         let mut c = Clock::new();
-        let quiet = drive(&mut s, &mut c, 4, || integrity("system", false));
+        let quiet = drive(&mut s, &mut c, 4, || integrity("system", Integrity::Honest));
         assert!(quiet.is_empty(), "{quiet:#?}");
-        assert!(!s.resolvers["system"].hijacked);
+        assert_eq!(s.resolvers["system"].integrity, Integrity::Honest);
         assert_eq!(s.panel_health(MetricId::Dns), Health::Ok);
     }
 
@@ -2466,14 +2544,16 @@ mod tests {
     fn a_hijacking_resolver_warns_and_reddens_the_dns_panel() {
         let mut s = AppState::new(test_config());
         let mut c = Clock::new();
-        let out = drive(&mut s, &mut c, 3, || integrity("system", true));
+        let out = drive(&mut s, &mut c, 3, || {
+            integrity("system", Integrity::Hijacked)
+        });
         assert_eq!(out.len(), 1, "{out:#?}");
         assert_eq!(out[0].metric, MetricId::Dns);
         assert_eq!(out[0].target.as_deref(), Some("system"));
         // Warn, not Crit: the resolver is answering, it is just answering for names it has
         // no business answering for. Names still resolve; the dashboard is not down.
         assert_eq!(out[0].severity, Health::Warn);
-        assert!(s.resolvers["system"].hijacked);
+        assert_eq!(s.resolvers["system"].integrity, Integrity::Hijacked);
         assert_eq!(s.panel_health(MetricId::Dns), Health::Warn);
     }
 
@@ -2481,18 +2561,44 @@ mod tests {
     fn a_resolver_that_stops_hijacking_says_so() {
         let mut s = AppState::new(test_config());
         let mut c = Clock::new();
-        drive(&mut s, &mut c, 3, || integrity("system", true));
-        let out = drive(&mut s, &mut c, 3, || integrity("system", false));
+        drive(&mut s, &mut c, 3, || {
+            integrity("system", Integrity::Hijacked)
+        });
+        let out = drive(&mut s, &mut c, 3, || integrity("system", Integrity::Honest));
         assert_eq!(out.len(), 1, "{out:#?}");
         assert_eq!(out[0].severity, Health::Ok);
-        assert!(!s.resolvers["system"].hijacked);
+        assert_eq!(s.resolvers["system"].integrity, Integrity::Honest);
+    }
+
+    // Forgery and hijacking are both integrity faults, but they name different culprits: one
+    // is the resolver lying, the other is somebody else speaking for it. The incident text
+    // has to say which, because the fix differs.
+    #[test]
+    fn a_forged_resolver_says_somebody_is_answering_in_its_place() {
+        let mut s = AppState::new(test_config());
+        let mut c = Clock::new();
+        let out = drive(&mut s, &mut c, 3, || {
+            integrity("cloudflare", Integrity::Forged)
+        });
+        assert_eq!(out.len(), 1, "{out:#?}");
+        assert_eq!(out[0].severity, Health::Warn);
+        assert_eq!(out[0].target.as_deref(), Some("cloudflare"));
+        let text = &out[0].message;
+        assert!(
+            text.contains("in place of"),
+            "must name the forgery rather than blame the resolver: {text}"
+        );
+        assert_eq!(s.resolvers["cloudflare"].integrity, Integrity::Forged);
+        assert_eq!(s.panel_health(MetricId::Dns), Health::Warn);
     }
 
     #[test]
     fn a_hijack_does_not_disturb_the_resolvers_timing_verdict() {
         let mut s = AppState::new(test_config());
         let mut c = Clock::new();
-        drive(&mut s, &mut c, 3, || integrity("system", true));
+        drive(&mut s, &mut c, 3, || {
+            integrity("system", Integrity::Hijacked)
+        });
         assert_eq!(
             s.resolvers["system"].health_current(),
             Health::Ok,
@@ -2726,7 +2832,7 @@ mod tests {
             handshake("cloudflare", None),
             tls("cloudflare", None, None),
             tls("google", Some(20.0), Some(-2)),
-            integrity("system", true),
+            integrity("system", Integrity::Hijacked),
             Sample::Reachability {
                 endpoint: "https".into(),
                 ok: false,
@@ -3170,14 +3276,14 @@ mod tests {
             c.tick(),
             Sample::Dns {
                 resolver: "cloudflare".into(),
-                latency_ms: None,
+                answer: Answer::Silence,
             },
         );
         let out = s.apply_sample(
             c.tick(),
             Sample::Dns {
                 resolver: "cloudflare".into(),
-                latency_ms: None,
+                answer: Answer::Silence,
             },
         );
         assert_eq!(out.len(), 1);
@@ -3195,14 +3301,14 @@ mod tests {
             c.tick(),
             Sample::Dns {
                 resolver: "system".into(),
-                latency_ms: Some(150.0),
+                answer: Answer::Addresses(150.0),
             },
         );
         let out = s.apply_sample(
             c.tick(),
             Sample::Dns {
                 resolver: "system".into(),
-                latency_ms: Some(160.0),
+                answer: Answer::Addresses(160.0),
             },
         );
         assert_eq!(out.len(), 1);
