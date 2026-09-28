@@ -9,7 +9,9 @@ use crate::metrics::{Hop, Probe, Sample};
 #[derive(Debug, Clone, PartialEq)]
 pub struct Route {
     pub hops: usize,
-    pub reachable: bool,
+    /// Whether the trace terminated at the target. Not the same as the target being
+    /// reachable — see [`Sample::Routing`].
+    pub reached_target: bool,
     /// Per-hop address (or `"*"` for a non-responding hop), first hop first.
     pub path: Vec<String>,
     /// Per-hop detail (address, best RTT, probe loss), first hop first.
@@ -62,7 +64,7 @@ fn parse_hop(tokens: &[&str]) -> Hop {
     }
 }
 
-/// Parse `traceroute -n` output. `reachable` is true when the final hop is `target`.
+/// Parse `traceroute -n` output. `reached_target` is true when the final hop is `target`.
 pub fn parse_traceroute(output: &str, target: &str) -> Route {
     let mut detail = Vec::new();
     for line in output.lines() {
@@ -75,10 +77,10 @@ pub fn parse_traceroute(output: &str, target: &str) -> Route {
         detail.push(parse_hop(&tokens));
     }
     let path: Vec<String> = detail.iter().map(|h| h.addr.clone()).collect();
-    let reachable = path.last().map(|h| h == target).unwrap_or(false);
+    let reached_target = path.last().map(|h| h == target).unwrap_or(false);
     Route {
         hops: detail.len(),
-        reachable,
+        reached_target,
         path,
         detail,
     }
@@ -119,7 +121,7 @@ impl Probe for RoutingProbe {
         vec![Sample::Routing {
             target: self.target.clone(),
             hops: route.hops,
-            reachable: route.reachable,
+            reached_target: route.reached_target,
             changed,
             detail: route.detail,
         }]
@@ -156,14 +158,14 @@ mod tests {
     fn parses_reached_path() {
         let r = parse_traceroute(REACHED, "1.1.1.1");
         assert_eq!(r.hops, 4);
-        assert!(r.reachable);
+        assert!(r.reached_target);
         assert_eq!(r.path, vec!["192.168.1.1", "96.120.1.1", "*", "1.1.1.1"]);
     }
 
     #[test]
     fn parses_per_hop_rtt_and_loss() {
         let r = parse_traceroute(MULTI, "1.1.1.1");
-        assert!(r.reachable);
+        assert!(r.reached_target);
         // Hop 1: three good probes, best 1.0 ms, no loss.
         assert_eq!(r.detail[0].addr, "192.168.1.1");
         assert_eq!(r.detail[0].min_rtt_ms, Some(1.0));
@@ -183,14 +185,14 @@ mod tests {
     fn parses_unreached_path() {
         let r = parse_traceroute(UNREACHED, "1.1.1.1");
         assert_eq!(r.hops, 3);
-        assert!(!r.reachable);
+        assert!(!r.reached_target);
         assert_eq!(r.path.last().unwrap(), "*");
     }
 
     #[test]
-    fn empty_output_is_unreachable() {
+    fn empty_output_reaches_nothing() {
         let r = parse_traceroute("", "1.1.1.1");
         assert_eq!(r.hops, 0);
-        assert!(!r.reachable);
+        assert!(!r.reached_target);
     }
 }

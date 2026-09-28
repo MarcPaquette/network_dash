@@ -166,14 +166,117 @@ impl LossWindow {
         self.ring.is_empty()
     }
 
-    /// Percentage of unanswered probes in the window, `0.0..=100.0`. Empty window is 0.0.
+    /// Percentage of unanswered probes among those actually recorded, `0.0..=100.0`. Empty
+    /// window is 0.0. This is the observed figure, and what the panel shows.
     pub fn loss_pct(&self) -> f64 {
         let n = self.ring.len();
         if n == 0 {
             return 0.0;
         }
-        let lost = self.ring.iter().filter(|&&answered| !answered).count();
-        (lost as f64 / n as f64) * 100.0
+        (self.lost() as f64 / n as f64) * 100.0
+    }
+
+    /// Loss as a rate over the **whole** window, counting slots not yet probed as answered.
+    ///
+    /// This is what the health verdict reads, and it differs from [`Self::loss_pct`] only
+    /// until the window first fills. Dividing by the probes seen so far makes the opening
+    /// minute wildly overconfident: one dropped echo eleven probes after launch is "9%
+    /// loss", a crit-grade rate inferred from a single packet. A window is a rate over a
+    /// span of time, and time that has not passed yet has not lost anything.
+    pub fn rate_over_window(&self) -> f64 {
+        (self.lost() as f64 / self.ring.capacity() as f64) * 100.0
+    }
+
+    /// Number of unanswered probes currently in the window.
+    pub fn lost(&self) -> usize {
+        self.ring.iter().filter(|&&answered| !answered).count()
+    }
+}
+
+/// What a window of probe outcomes says the *typical* probe does.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Typical {
+    /// Nothing has been recorded yet.
+    Unknown,
+    /// The typical probe comes back in this many milliseconds.
+    Rtt(f64),
+    /// The typical probe does not come back at all.
+    TimedOut,
+}
+
+/// A short rolling window of probe outcomes — a measured RTT, or a timeout.
+///
+/// This is what the latency verdict is read from, and it exists because the alternative —
+/// classifying the single most recent packet — cannot tell a link that is slow from a link
+/// that was slow *once*. Over Wi-Fi an isolated 200 ms echo to your own router is ordinary
+/// (the radio was asleep), and judging it in isolation reports a fault that nothing else on
+/// the dashboard can corroborate.
+///
+/// Deliberately short: the verdict has to be able to change within a few probes, so this is
+/// not the same window the chart is drawn from.
+#[derive(Debug, Clone)]
+pub struct OutcomeWindow {
+    ring: RingBuffer<Option<f64>>,
+}
+
+impl OutcomeWindow {
+    pub fn new(cap: usize) -> Self {
+        Self {
+            ring: RingBuffer::new(cap),
+        }
+    }
+
+    /// Record one probe: its RTT, or `None` if it timed out.
+    pub fn record(&mut self, rtt_ms: Option<f64>) {
+        self.ring.push(rtt_ms);
+    }
+
+    pub fn len(&self) -> usize {
+        self.ring.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.ring.is_empty()
+    }
+
+    /// The median outcome, with timeouts ranked worse than any RTT.
+    ///
+    /// Ranking a lost packet above the slowest measured one is the whole point: sorting it
+    /// anywhere else lets an outage — where there is no RTT to be slow — read as healthy.
+    pub fn typical(&self) -> Typical {
+        let n = self.ring.len();
+        if n == 0 {
+            return Typical::Unknown;
+        }
+        let mut sorted: Vec<Option<f64>> = self.ring.iter().copied().collect();
+        // `None` (a timeout) sorts last: worse than every measured value.
+        sorted.sort_by(|a, b| match (a, b) {
+            (Some(x), Some(y)) => x.total_cmp(y),
+            (Some(_), None) => std::cmp::Ordering::Less,
+            (None, Some(_)) => std::cmp::Ordering::Greater,
+            (None, None) => std::cmp::Ordering::Equal,
+        });
+        // Nearest-rank median, matching `Series::percentile`'s convention.
+        match sorted[(n - 1) / 2] {
+            Some(ms) => Typical::Rtt(ms),
+            None => Typical::TimedOut,
+        }
+    }
+}
+
+/// Render a span of seconds as a compact age: `45s`, `3m`, `2h`, `2d`.
+///
+/// Shared by the panel that ages a reading and the diagnosis text that quotes the window a
+/// baseline was drawn from — one implementation, so the two can never describe the same
+/// span differently. A negative span (a clock that stepped backwards) reads as `0s` rather
+/// than as a measurement from the future.
+pub fn compact_age(secs: i64) -> String {
+    let s = secs.max(0);
+    match s {
+        _ if s < 60 => format!("{s}s"),
+        _ if s < 3_600 => format!("{}m", s / 60),
+        _ if s < 86_400 => format!("{}h", s / 3_600),
+        _ => format!("{}d", s / 86_400),
     }
 }
 
@@ -320,5 +423,120 @@ mod tests {
         }
         assert_eq!(w.len(), 4);
         approx(w.loss_pct(), 0.0);
+    }
+
+    /// A rate needs a denominator. Before the window fills, the observed figure and the
+    /// rate over the window are different numbers, and only one of them is safe to judge.
+    #[test]
+    fn a_partly_filled_loss_window_does_not_inflate_the_rate() {
+        let mut w = LossWindow::new(60);
+        w.record(false);
+        for _ in 0..10 {
+            w.record(true);
+        }
+        approx(w.loss_pct(), 100.0 / 11.0); // observed: 9%, and honestly so
+        approx(w.rate_over_window(), 100.0 / 60.0); // judged: 1.7%, one packet in a minute
+    }
+
+    #[test]
+    fn a_full_loss_window_reports_the_same_rate_either_way() {
+        let mut w = LossWindow::new(4);
+        w.record(false);
+        for _ in 0..3 {
+            w.record(true);
+        }
+        approx(w.loss_pct(), 25.0);
+        approx(w.rate_over_window(), 25.0);
+    }
+
+    /// An outage from the first probe still crosses a crit bound quickly — the point is to
+    /// stop inferring a rate from one packet, not to go quiet during a real one.
+    #[test]
+    fn a_total_outage_still_climbs_the_rate_fast() {
+        let mut w = LossWindow::new(60);
+        for _ in 0..6 {
+            w.record(false);
+        }
+        approx(w.rate_over_window(), 10.0);
+    }
+
+    /// Feed a window of `cap` outcomes and read its verdict.
+    fn outcomes(cap: usize, seq: &[Option<f64>]) -> Typical {
+        let mut w = OutcomeWindow::new(cap);
+        for &o in seq {
+            w.record(o);
+        }
+        w.typical()
+    }
+
+    #[test]
+    fn an_empty_outcome_window_has_no_opinion() {
+        assert_eq!(OutcomeWindow::new(10).typical(), Typical::Unknown);
+    }
+
+    #[test]
+    fn the_typical_outcome_is_the_median_rtt() {
+        let seq: Vec<Option<f64>> = [5.0, 4.0, 6.0, 5.0, 200.0]
+            .iter()
+            .map(|&v| Some(v))
+            .collect();
+        assert_eq!(outcomes(10, &seq), Typical::Rtt(5.0));
+    }
+
+    /// The reason this type exists: one slow packet on an otherwise quick link is not a slow
+    /// link, and reading the latest outcome instead of the median is how it was reported as one.
+    #[test]
+    fn a_lone_spike_does_not_move_the_typical_outcome() {
+        let mut seq: Vec<Option<f64>> = (0..9).map(|_| Some(4.0)).collect();
+        seq.push(Some(400.0));
+        assert_eq!(outcomes(10, &seq), Typical::Rtt(4.0));
+    }
+
+    /// ...and neither does one dropped packet. A window that flipped to `TimedOut` here would
+    /// report a total outage every time Wi-Fi lost a single echo.
+    #[test]
+    fn a_lone_timeout_does_not_move_the_typical_outcome() {
+        let mut seq: Vec<Option<f64>> = (0..9).map(|_| Some(4.0)).collect();
+        seq.push(None);
+        assert_eq!(outcomes(10, &seq), Typical::Rtt(4.0));
+    }
+
+    /// A timeout is not fast. Sorting it as a missing value rather than as the worst possible
+    /// one is how an outage — where there is no RTT left to be slow — reads as healthy.
+    #[test]
+    fn a_window_of_mostly_timeouts_is_a_timeout() {
+        let seq = vec![Some(4.0), None, None, None, Some(5.0)];
+        assert_eq!(outcomes(10, &seq), Typical::TimedOut);
+    }
+
+    #[test]
+    fn a_sustained_slowdown_moves_the_typical_outcome() {
+        let seq: Vec<Option<f64>> = (0..10).map(|_| Some(120.0)).collect();
+        assert_eq!(outcomes(10, &seq), Typical::Rtt(120.0));
+    }
+
+    /// The window is short on purpose, so a link that recovers is not held down by history.
+    #[test]
+    fn the_outcome_window_forgets_beyond_its_capacity() {
+        let mut seq: Vec<Option<f64>> = (0..5).map(|_| Some(500.0)).collect();
+        seq.extend((0..5).map(|_| Some(3.0)));
+        assert_eq!(outcomes(5, &seq), Typical::Rtt(3.0));
+    }
+
+    #[test]
+    fn an_age_reads_in_the_largest_unit_that_still_says_something() {
+        assert_eq!(compact_age(0), "0s");
+        assert_eq!(compact_age(45), "45s");
+        assert_eq!(compact_age(90), "1m");
+        assert_eq!(compact_age(180), "3m");
+        assert_eq!(compact_age(3600), "1h");
+        assert_eq!(compact_age(7_200), "2h");
+        assert_eq!(compact_age(172_800), "2d");
+    }
+
+    // A clock that stepped backwards must not render "-3s ago".
+    #[test]
+    fn a_negative_span_is_not_an_age() {
+        assert_eq!(compact_age(-5), "0s");
     }
 }

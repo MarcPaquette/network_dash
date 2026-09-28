@@ -129,12 +129,17 @@ pub enum Sample {
         tx_rate: Option<f64>,
         ssid: Option<String>,
     },
-    /// Routing/path result for a target: hop count, reachability, whether the path changed
-    /// since the last probe, and per-hop detail (address, best RTT, probe loss).
+    /// Routing/path result for a target: hop count, whether the trace actually terminated at
+    /// the target, whether the path changed since the last probe, and per-hop detail
+    /// (address, best RTT, probe loss).
+    ///
+    /// `reached_target` is a fact about the *trace*, not about the target. Plenty of hosts
+    /// forward traffic perfectly while dropping traceroute's probes, so the reducer weighs
+    /// this against whether ping is getting through before calling anything unreachable.
     Routing {
         target: String,
         hops: usize,
-        reachable: bool,
+        reached_target: bool,
         changed: bool,
         detail: Vec<Hop>,
     },

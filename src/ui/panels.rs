@@ -12,6 +12,7 @@ use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph};
 
 use crate::app::AppState;
 use crate::health::Health;
+use crate::history::compact_age;
 use crate::metrics::MetricId;
 use crate::metrics::dns::{Answer, Integrity};
 use crate::ui::theme;
@@ -796,15 +797,20 @@ pub fn routing(frame: &mut Frame, area: Rect, state: &AppState) {
         return;
     }
     let r = &state.routing;
-    let (status, color) = if !r.reachable {
+    let (status, color) = if !r.reachable() {
         ("unreachable", state.theme.crit)
     } else if r.changed {
         ("route changed", state.theme.warn)
+    } else if r.path_incomplete() {
+        // The trace ran out of responding hops but echoes still come back from the target.
+        // Worth saying — the path below is partial — but in the neutral colour, because
+        // nothing is wrong: plenty of routers drop traceroute probes as a matter of policy.
+        ("incomplete (target answering)", state.theme.muted)
     } else {
         ("stable", state.theme.ok)
     };
-    // Per-hop detail: the path RTT when reachable, or where it dies when not.
-    let hop_info = if r.reachable {
+    // Per-hop detail: the path RTT when the trace finished, or where it stopped when not.
+    let hop_info = if r.reached_target {
         r.detail
             .last()
             .and_then(|h| h.min_rtt_ms)
@@ -959,9 +965,21 @@ pub fn throughput(frame: &mut Frame, area: Rect, state: &AppState) {
         .last_mbps
         .map(|m| format!("{m:.0} Mbps"))
         .unwrap_or_else(|| "—".into());
+    let mut probe_line = format!("capacity: {probe}");
+    // What the link normally carries — but only once the verdict is that it has fallen. A
+    // bare Mbps number cannot tell a small link from a broken one, so a fault has to quote
+    // the baseline it fell from; a healthy link quoting it is noise on every frame.
+    if state.throughput.capacity_health_current() > Health::Ok
+        && let Some(base) = state.throughput.baseline
+    {
+        probe_line.push_str(&format!(
+            " (typical {:.0}, down {:.0}%)",
+            base.typical_mbps,
+            (100.0 - base.pct_of_typical).max(0.0)
+        ));
+    }
     // Append the bufferbloat delta (added latency under load) when measured, with its tail:
     // bloat is intermittent, so the latest reading alone routinely misses it entirely.
-    let mut probe_line = format!("capacity: {probe}");
     if let Some(bloat) = &state.throughput.added_latency_ms
         && let Some(cur) = bloat.latest()
     {
@@ -969,6 +987,15 @@ pub fn throughput(frame: &mut Frame, area: Rect, state: &AppState) {
         if let Some(p95) = bloat.p95() {
             probe_line.push_str(&format!(" (p95 +{p95:.0}ms)"));
         }
+    }
+    // How old the reading is. The capacity probe runs minutes apart and generates its own
+    // traffic, so without an age this line renders a stale synthetic burst beside live
+    // counters and reads as a live statement about a link that is sitting idle.
+    if let (Some(at), Some(now)) = (state.throughput.last_capacity_at, state.last_seen) {
+        probe_line.push_str(&format!(
+            "   measured {} ago",
+            compact_age((now - at).num_seconds())
+        ));
     }
     let (summary, chart) = summary_and_chart(inner, 3);
     let lines = vec![
@@ -1038,11 +1065,18 @@ pub fn throughput(frame: &mut Frame, area: Rect, state: &AppState) {
         )];
         // Same relevance rule as latency, mirrored for a lower-is-worse metric: band a
         // bound only once the line has come down near it.
+        //
+        // The bounds are percentages of this link's own baseline, so the bands sit wherever
+        // that baseline currently is — which is the only height at which a capacity bound
+        // means anything. No baseline yet, no bands.
         let floor = values.iter().copied().fold(f64::INFINITY, f64::min);
-        let thr = &state.config.thresholds.throughput;
-        for (level, color) in [(thr.warn, state.theme.warn), (thr.crit, state.theme.crit)] {
-            if floor <= level * 1.6 {
-                series.push(LineSeries::reference(color, level, x_max));
+        if let Some(base) = state.throughput.baseline {
+            let thr = state.config.thresholds.capacity_drop;
+            for (pct, color) in [(thr.warn, state.theme.warn), (thr.crit, state.theme.crit)] {
+                let level = base.typical_mbps * pct / 100.0;
+                if floor <= level * 1.6 {
+                    series.push(LineSeries::reference(color, level, x_max));
+                }
             }
         }
         let (_, y_max) = chart_bounds(&series, 10.0);
@@ -2249,6 +2283,60 @@ mod tests {
         );
     }
 
+    // The capacity probe runs minutes apart and makes its own traffic. Rendered next to
+    // live rx/tx counters with no age, a five-minute-old synthetic burst reads as a
+    // statement about a link that is in fact sitting idle.
+    #[test]
+    fn the_capacity_reading_says_how_old_it_is() {
+        let mut state = test_state();
+        let t0 = Utc.with_ymd_and_hms(2026, 7, 20, 14, 0, 0).unwrap();
+        state.apply_sample(t0, Sample::ThroughputProbe { mbps: 412.0 });
+        state.tick(t0 + chrono::Duration::minutes(3));
+        let mut term = Terminal::new(TestBackend::new(80, 20)).unwrap();
+        term.draw(|f| throughput(f, f.area(), &state)).unwrap();
+        let text = buffer_text(&term);
+        assert!(text.contains("412 Mbps"), "{text}");
+        assert!(text.contains("measured 3m ago"), "age missing: {text}");
+    }
+
+    // A bare "30 Mbps" is a fact about a link, not a fault report. Once the verdict is that
+    // capacity has collapsed, the panel has to show what it collapsed *from*.
+    #[test]
+    fn a_collapsed_capacity_shows_what_normal_looks_like() {
+        let mut state = test_state();
+        let mut t = Utc.with_ymd_and_hms(2026, 7, 20, 14, 0, 0).unwrap();
+        for mbps in [410.0, 400.0, 415.0, 405.0, 410.0, 30.0, 28.0] {
+            state.apply_sample(t, Sample::ThroughputProbe { mbps });
+            t += chrono::Duration::minutes(5);
+        }
+        state.tick(t);
+        let mut term = Terminal::new(TestBackend::new(80, 20)).unwrap();
+        term.draw(|f| throughput(f, f.area(), &state)).unwrap();
+        let text = buffer_text(&term);
+        // 405, not 410: the baseline is the median of everything before the latest reading,
+        // and the first collapsed reading is already in that set dragging it down a slot.
+        assert!(text.contains("typical 405"), "baseline missing: {text}");
+        assert!(text.contains("down 93%"), "the fall missing: {text}");
+    }
+
+    // ...and a healthy link does not carry that clutter. "typical 410" next to "412" is
+    // noise on every frame for as long as nothing is wrong.
+    #[test]
+    fn a_healthy_capacity_does_not_quote_its_own_baseline() {
+        let mut state = test_state();
+        let mut t = Utc.with_ymd_and_hms(2026, 7, 20, 14, 0, 0).unwrap();
+        for mbps in [410.0, 400.0, 415.0, 405.0, 410.0, 412.0] {
+            state.apply_sample(t, Sample::ThroughputProbe { mbps });
+            t += chrono::Duration::minutes(5);
+        }
+        state.tick(t);
+        let mut term = Terminal::new(TestBackend::new(80, 20)).unwrap();
+        term.draw(|f| throughput(f, f.area(), &state)).unwrap();
+        let text = buffer_text(&term);
+        assert!(!text.contains("typical"), "should stay quiet: {text}");
+        assert!(text.contains("412 Mbps"), "{text}");
+    }
+
     #[test]
     fn throughput_summary_reports_the_bufferbloat_tail() {
         let mut state = test_state();
@@ -2284,7 +2372,9 @@ mod tests {
         // Frozen clock in the render tests: no dwell, so a fed sample is committed at once.
         c.thresholds.trip_after_secs = 0.0;
         c.thresholds.clear_after_secs = 0.0;
-        c.thresholds.loss_window = 8;
+        // 20 wide so the single dropped probe below lands at 5% — a warn-grade rate, which
+        // is what this fixture wants on the board. Loss is judged over the whole window.
+        c.thresholds.loss_window = 20;
         let mut s = AppState::new(c);
         let t0 = Utc.with_ymd_and_hms(2026, 7, 20, 14, 0, 0).unwrap();
 
@@ -2360,7 +2450,7 @@ mod tests {
             Sample::Routing {
                 target: "1.1.1.1".into(),
                 hops: 4,
-                reachable: true,
+                reached_target: true,
                 changed: false,
                 detail: vec![
                     Hop {
@@ -2508,7 +2598,7 @@ mod tests {
             Sample::Routing {
                 target: "1.1.1.1".into(),
                 hops: hops.len(),
-                reachable: true,
+                reached_target: true,
                 changed: false,
                 detail: hops
                     .iter()
@@ -2625,7 +2715,7 @@ mod tests {
             Sample::Routing {
                 target: "1.1.1.1".into(),
                 hops: 8,
-                reachable: true,
+                reached_target: true,
                 changed: false,
                 detail: vec![
                     Hop {
@@ -2648,6 +2738,55 @@ mod tests {
         assert!(text.contains("stable"));
         // The final-hop RTT is surfaced now that we parse per-hop timings.
         assert!(text.contains("12ms"), "should show final-hop RTT: {text}");
+    }
+
+    #[test]
+    fn routing_panel_calls_an_unmapped_path_incomplete_not_unreachable() {
+        let mut state = test_state();
+        let now = Utc.with_ymd_and_hms(2026, 7, 20, 14, 0, 0).unwrap();
+        // Echoes are coming back from the target, so it is up whatever traceroute managed
+        // to map.
+        state.apply_sample(
+            now,
+            Sample::Latency {
+                target: "1.1.1.1".into(),
+                rtt_ms: Some(12.0),
+            },
+        );
+        state.apply_sample(
+            now,
+            Sample::Routing {
+                target: "1.1.1.1".into(),
+                hops: 9,
+                reached_target: false,
+                changed: false,
+                detail: vec![
+                    Hop {
+                        addr: "192.168.1.1".into(),
+                        min_rtt_ms: Some(1.0),
+                        loss_pct: 0.0,
+                    },
+                    Hop {
+                        addr: "*".into(),
+                        min_rtt_ms: None,
+                        loss_pct: 100.0,
+                    },
+                ],
+            },
+        );
+        let mut term = Terminal::new(TestBackend::new(40, 8)).unwrap();
+        term.draw(|f| routing(f, f.area(), &state)).unwrap();
+        let text = buffer_text(&term);
+        assert!(
+            !text.contains("unreachable"),
+            "the target is answering echoes; only the *trace* fell short: {text}"
+        );
+        assert!(
+            text.contains("incomplete"),
+            "an unfinished trace is worth saying, just not in red: {text}"
+        );
+        // And the panel border stays green, since nothing is actually wrong.
+        assert_eq!(state.panel_health(MetricId::Routing), Health::Ok);
     }
 
     #[test]

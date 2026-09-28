@@ -105,11 +105,22 @@ impl Thresholds {
 /// slow to report is a fault you notice from a user complaint instead. Clearing is slow,
 /// because a link that dips healthy for a moment mid-flap is not fixed, and reporting it
 /// as recovered turns one incident into a stream of round trips.
+///
+/// So is *cancellation*, for a less obvious reason. A sample that returns to the committed
+/// state abandons a pending change — but only when the pending change is a fault not yet
+/// believed. Abandoning a pending **recovery** the same way makes clearing require a stretch
+/// of `clear_after` with no bad sample anywhere in it, which on a link that spikes at all
+/// simply never arrives: the state ratchets to bad on the first rough patch and stays there
+/// for the life of the process. A recovery in progress therefore survives an isolated
+/// relapse, and is only called off once the fault has reasserted itself for `trip_after` —
+/// the same evidence it took to believe the fault in the first place.
 #[derive(Debug, Clone)]
 pub struct Debouncer {
     current: Health,
     /// The differing state we are waiting on, and when its run began.
     pending: Option<(Health, DateTime<Utc>)>,
+    /// While a recovery is pending, when the committed fault started reasserting itself.
+    relapse_since: Option<DateTime<Utc>>,
     trip_after: Duration,
     clear_after: Duration,
 }
@@ -121,6 +132,7 @@ impl Debouncer {
         Self {
             current: initial,
             pending: None,
+            relapse_since: None,
             trip_after,
             clear_after,
         }
@@ -135,10 +147,27 @@ impl Debouncer {
     /// confirmed transition, otherwise `None`.
     pub fn update(&mut self, now: DateTime<Utc>, raw: Health) -> Option<Health> {
         if raw == self.current {
-            // Back to (or still at) the committed state: abandon any pending change.
-            self.pending = None;
+            match self.pending {
+                // A pending *recovery* is not called off by one bad sample — see the type
+                // docs. It survives until the fault has held for the trip dwell, which is
+                // the same evidence that committed it to begin with.
+                Some((candidate, _)) if candidate < self.current => {
+                    let since = *self.relapse_since.get_or_insert(now);
+                    // A clock corrected backwards must not strand the relapse in the future.
+                    let since = since.min(now);
+                    self.relapse_since = Some(since);
+                    if now.signed_duration_since(since) >= self.trip_after {
+                        self.pending = None;
+                        self.relapse_since = None;
+                    }
+                }
+                // A pending fault, not yet believed: good news cancels it outright.
+                _ => self.pending = None,
+            }
             return None;
         }
+        // Off the committed state again, so any relapse run is over.
+        self.relapse_since = None;
         let worsening = raw > self.current;
         let since = match &mut self.pending {
             // Still on the same side of the committed state — a fault that deepened, or a
@@ -386,6 +415,61 @@ mod tests {
     #[test]
     fn debouncer_return_to_stable_clears_pending() {
         // Crit for 2s, back to Ok, then Crit again: the clock restarts from the second run.
+        let out = run(
+            HOk,
+            secs(3),
+            secs(15),
+            &[(0, Crit), (2, Crit), (3, HOk), (4, Crit), (6, Crit)],
+        );
+        assert_eq!(out, vec![None, None, None, None, None]);
+    }
+
+    /// The ratchet this guards against: with instant cancellation, clearing needed a
+    /// *spike-free* stretch of the full clear dwell, and one bad sample sent it back to
+    /// zero. On any link that spikes at all — every Wi-Fi link — that stretch never arrives,
+    /// so the committed state went bad once and stayed bad for the life of the process.
+    #[test]
+    fn debouncer_a_lone_relapse_does_not_restart_a_recovery() {
+        let out = run(
+            Crit,
+            secs(3),
+            secs(15),
+            &[
+                (0, HOk),
+                (5, HOk),
+                (10, HOk),
+                (11, Crit),
+                (12, HOk),
+                (15, HOk),
+            ],
+        );
+        assert_eq!(out, vec![None, None, None, None, None, Some(HOk)]);
+    }
+
+    #[test]
+    fn debouncer_a_relapse_that_persists_cancels_the_recovery() {
+        // The fault reasserts itself for the full trip dwell, so it is believed again and
+        // the recovery has to start over from the sample that follows it.
+        let mut d = Debouncer::new(Crit, secs(3), secs(15));
+        for at in [0, 1, 2] {
+            assert_eq!(d.update(t0() + secs(at), HOk), None);
+        }
+        for at in [3, 4, 5, 6] {
+            assert_eq!(d.update(t0() + secs(at), Crit), None);
+        }
+        // 21s after the first healthy sample — long past the clear dwell had the run
+        // survived — but only 14s into the run that actually counts.
+        assert_eq!(d.update(t0() + secs(7), HOk), None);
+        assert_eq!(d.update(t0() + secs(21), HOk), None);
+        assert_eq!(d.update(t0() + secs(22), HOk), Some(HOk));
+    }
+
+    /// The two directions are not symmetric, and deliberately so. Good news cancels a
+    /// not-yet-believed fault instantly, because the cost of being wrong is one late alert.
+    /// Bad news cannot cancel a recovery instantly, because the cost of *that* being wrong
+    /// is a panel that never goes green again.
+    #[test]
+    fn debouncer_good_news_still_cancels_a_pending_trip_immediately() {
         let out = run(
             HOk,
             secs(3),

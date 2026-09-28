@@ -179,8 +179,23 @@ pub struct ThresholdConfig {
     pub snr: Thresholds,
     /// Added latency under load (bufferbloat) in ms (higher is worse).
     pub bufferbloat: Thresholds,
-    /// Measured link capacity in Mbps (lower is worse).
-    pub throughput: Thresholds,
+    /// Measured link capacity as a **percentage of the link's own demonstrated baseline**
+    /// (lower is worse). 50/25 means: warn once a reading is half what this link normally
+    /// carries, crit at a quarter.
+    ///
+    /// Deliberately relative. An absolute Mbps floor is a spec check rather than a fault
+    /// detector — it answers "is this link fast?", which is a property of the plan someone
+    /// bought. A steady 8 Mbps line is not broken, and a gigabit line at 30 Mbps is, and no
+    /// single floor can say both. See [`crate::metrics::throughput::capacity_baseline`].
+    pub capacity_drop: Thresholds,
+    /// Capacity readings required before any verdict is formed. A link nobody has watched
+    /// long enough to have a normal cannot be said to have fallen below it.
+    pub capacity_baseline_min: usize,
+    /// **Deprecated** — an absolute Mbps floor, replaced by `capacity_drop` above. Still
+    /// accepted so existing configs load; on load it is recorded in
+    /// [`Config::deprecated_keys`] and dropped, so it never round-trips back out.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub throughput: Option<Thresholds>,
     /// TCP handshake time in ms (higher is worse). Looser than the ping thresholds on
     /// purpose: a handshake is a full round trip plus the far end's accept queue, so it is
     /// legitimately slower than ICMP to the same host and would cry wolf at ping's limits.
@@ -209,6 +224,16 @@ pub struct ThresholdConfig {
     pub debounce_samples: Option<usize>,
     /// Number of ping outcomes retained for the loss window.
     pub loss_window: usize,
+    /// Number of recent ping outcomes the *latency* verdict is read from.
+    ///
+    /// The verdict is the median of this window, not the last packet. One slow echo is not
+    /// a slow link — over Wi-Fi an isolated 200 ms reply from your own router is ordinary,
+    /// and classifying it on its own reported a fault nothing else could corroborate.
+    ///
+    /// Short on purpose. Everything here trades detection lag against false alarms: at the
+    /// 1 s ping cadence, 10 means a hard outage is visible in about five probes (plus the
+    /// trip dwell) and no burst shorter than half the window can raise one.
+    pub latency_window: usize,
     /// Number of points retained per history series (chart width).
     pub history_len: usize,
 }
@@ -217,14 +242,27 @@ impl Default for ThresholdConfig {
     fn default() -> Self {
         Self {
             latency_internet: Thresholds::higher_is_worse(80.0, 150.0),
-            latency_gateway: Thresholds::higher_is_worse(15.0, 50.0),
-            jitter: Thresholds::higher_is_worse(15.0, 40.0),
-            loss: Thresholds::higher_is_worse(1.0, 5.0),
+            // Calibrated for the radio this ships on, not for a switch port. The first hop
+            // of a Wi-Fi path is the slowest and least predictable part of it, and bounds
+            // borrowed from Ethernet (15/50) made a laptop on a perfectly good access point
+            // report a "local network problem" more or less permanently.
+            latency_gateway: Thresholds::higher_is_worse(25.0, 80.0),
+            // Jitter is what now carries the "erratic link" signal, since the latency
+            // verdict deliberately ignores individual spikes. Wi-Fi power-save alone puts
+            // tens of milliseconds of spread on an idle 1 Hz echo stream, so these are the
+            // bounds at which spread starts costing a call rather than merely existing.
+            jitter: Thresholds::higher_is_worse(40.0, 100.0),
+            // Warn tolerates exactly one lost echo per window and crit takes six. Losing a
+            // single ping a minute is what Wi-Fi does; at the old 1%/5% it was a yellow
+            // panel and, three packets later, a logged outage.
+            loss: Thresholds::higher_is_worse(2.0, 10.0),
             dns: Thresholds::higher_is_worse(100.0, 300.0),
             rssi: Thresholds::lower_is_worse(-70.0, -80.0),
             snr: Thresholds::lower_is_worse(20.0, 10.0),
             bufferbloat: Thresholds::higher_is_worse(100.0, 300.0),
-            throughput: Thresholds::lower_is_worse(100.0, 25.0),
+            capacity_drop: Thresholds::lower_is_worse(50.0, 25.0),
+            capacity_baseline_min: 5,
+            throughput: None,
             tcp_handshake: Thresholds::higher_is_worse(250.0, 1000.0),
             tls_handshake: Thresholds::higher_is_worse(400.0, 1500.0),
             cert_expiry_days: Thresholds::lower_is_worse(14.0, 3.0),
@@ -233,6 +271,7 @@ impl Default for ThresholdConfig {
             clear_after_secs: 15.0,
             debounce_samples: None,
             loss_window: 60,
+            latency_window: 10,
             history_len: 120,
         }
     }
@@ -358,23 +397,28 @@ impl Config {
     /// Fold deprecated keys into the fields that replaced them, then clear them so they
     /// do not round-trip back out.
     ///
-    /// `throughput.floor_mbps` only ever expressed a *warn* bound, so it seeds `warn` and
-    /// drags `crit` underneath it — leaving the stock 25 Mbps crit in place would classify
-    /// every merely-slow reading under a low floor as critical. An explicitly configured
-    /// `thresholds.throughput` always wins.
+    /// Both absolute capacity floors (`throughput.floor_mbps` and its successor
+    /// `thresholds.throughput`) are dropped rather than converted: there is nothing to
+    /// convert them *into*. `thresholds.capacity_drop` is a percentage of the link's own
+    /// baseline, and no Mbps number carries over into one.
     ///
-    /// `thresholds.debounce_samples` is dropped rather than converted, and recorded in
-    /// [`Config::deprecated_keys`] so the caller can say so: silently ignoring a knob
+    /// `thresholds.debounce_samples` is dropped the same way. Every dropped key is recorded
+    /// in [`Config::deprecated_keys`] so the caller can say so: silently ignoring a knob
     /// someone set is how you get a bug report about debouncing that nobody can reproduce.
     fn migrate_deprecated(&mut self) {
-        let stock = ThresholdConfig::default().throughput;
-        if let Some(floor) = self.throughput.floor_mbps.take() {
-            self.deprecated_keys
-                .push("throughput.floor_mbps (migrated into thresholds.throughput)".to_string());
-            if self.thresholds.throughput == stock {
-                self.thresholds.throughput =
-                    Thresholds::lower_is_worse(floor, stock.crit.min(floor / 4.0));
-            }
+        if self.throughput.floor_mbps.take().is_some() {
+            self.deprecated_keys.push(
+                "throughput.floor_mbps (ignored — capacity is judged against the link's own \
+                 baseline; see thresholds.capacity_drop)"
+                    .to_string(),
+            );
+        }
+        if self.thresholds.throughput.take().is_some() {
+            self.deprecated_keys.push(
+                "thresholds.throughput (ignored — an absolute Mbps floor; see \
+                 thresholds.capacity_drop)"
+                    .to_string(),
+            );
         }
         if self.thresholds.debounce_samples.take().is_some() {
             self.deprecated_keys.push(
@@ -537,38 +581,52 @@ mod tests {
         assert_eq!(c.ui.color, Config::default().ui.color);
     }
 
+    // Capacity is judged against the link's own demonstrated baseline, as a percentage of
+    // it. An absolute Mbps floor is a spec check — it calls a steady small link critical
+    // forever and says nothing when a fast one collapses to a fraction of itself.
     #[test]
-    fn throughput_thresholds_default_to_lower_is_worse() {
-        let t = Config::default().thresholds.throughput;
+    fn capacity_drop_defaults_to_a_percentage_of_the_links_own_baseline() {
+        let t = Config::default().thresholds.capacity_drop;
         assert_eq!(t.direction, Direction::LowerIsWorse);
         assert!(
-            t.crit < t.warn,
-            "crit must be the deeper degradation: {t:?}"
+            t.crit < t.warn && t.warn < 100.0,
+            "the bounds are percentages of normal: {t:?}"
         );
-    }
-
-    #[test]
-    fn deprecated_floor_mbps_seeds_the_throughput_warn_threshold() {
-        let c = Config::from_toml_str("[throughput]\nfloor_mbps = 20.0\n").unwrap();
-        assert_eq!(c.thresholds.throughput.warn, 20.0);
-        // ...and crit must stay strictly below it, or `evaluate` would classify every
-        // merely-warning value as critical.
         assert!(
-            c.thresholds.throughput.crit < 20.0,
-            "crit should scale under the migrated floor: {:?}",
-            c.thresholds.throughput
+            Config::default().thresholds.capacity_baseline_min >= 2,
+            "a baseline needs something to be a baseline of"
         );
     }
 
+    // Both absolute floors are gone. Neither is silently ignored: a knob someone set and
+    // the dashboard quietly dropped is how you get a bug report nobody can reproduce.
     #[test]
-    fn explicit_throughput_thresholds_beat_the_deprecated_floor() {
+    fn the_deprecated_absolute_floors_are_reported_rather_than_ignored() {
         let c = Config::from_toml_str(
             "[throughput]\nfloor_mbps = 20.0\n\n\
              [thresholds.throughput]\nwarn = 500.0\ncrit = 100.0\ndirection = \"lower_is_worse\"\n",
         )
         .unwrap();
-        assert_eq!(c.thresholds.throughput.warn, 500.0);
-        assert_eq!(c.thresholds.throughput.crit, 100.0);
+        let w = c.deprecation_warnings(Path::new("/etc/np.toml"));
+        assert!(
+            w.iter().any(|s| s.contains("floor_mbps")),
+            "floor_mbps should be named: {w:?}"
+        );
+        assert!(
+            w.iter().any(|s| s.contains("thresholds.throughput")),
+            "thresholds.throughput should be named: {w:?}"
+        );
+        // ...and the replacement is untouched by either of them.
+        assert_eq!(
+            c.thresholds.capacity_drop,
+            ThresholdConfig::default().capacity_drop
+        );
+    }
+
+    // An old config must still load. Dropping a removed key is a warning, not an error.
+    #[test]
+    fn a_config_using_the_old_floor_still_loads() {
+        assert!(Config::from_toml_str("[throughput]\nfloor_mbps = 20.0\n").is_ok());
     }
 
     #[test]
