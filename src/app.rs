@@ -13,9 +13,10 @@ use chrono::{DateTime, Timelike, Utc};
 use crate::config::{AlertConfig, Config};
 use crate::diagnosis::Layer;
 use crate::health::{Debouncer, FlapDetector, Health, Thresholds};
-use crate::history::{LossWindow, RingBuffer, Series};
+use crate::history::{LossWindow, OutcomeWindow, RingBuffer, Series, Typical};
 use crate::incidents::Incident;
 use crate::metrics::dns::{Answer, Integrity};
+use crate::metrics::throughput::CapacityBaseline;
 use crate::metrics::{Hop, MetricId, Sample};
 use crate::ui::theme::Theme;
 
@@ -56,6 +57,10 @@ pub struct TargetState {
     pub loss: LossWindow,
     /// Rolling history of the loss-window percentage, for the loss line graph.
     pub loss_history: Series,
+    /// The short window the latency verdict is read from. Separate from `latency_ms`, which
+    /// is the chart's history: the chart wants every point, the verdict wants the recent
+    /// few, and a timeout belongs in one of them but not the other.
+    recent: OutcomeWindow,
     latency_health: Debouncer,
     jitter_health: Debouncer,
     loss_health: Debouncer,
@@ -70,6 +75,7 @@ impl TargetState {
             latency_ms: Series::new(t.history_len),
             loss: LossWindow::new(t.loss_window),
             loss_history: Series::new(t.history_len),
+            recent: OutcomeWindow::new(t.latency_window),
             latency_health: Debouncer::new(Health::Ok, t.trip_after(), t.clear_after()),
             jitter_health: Debouncer::new(Health::Ok, t.trip_after(), t.clear_after()),
             loss_health: Debouncer::new(Health::Ok, t.trip_after(), t.clear_after()),
@@ -117,6 +123,14 @@ impl TargetState {
     }
     pub fn loss_health_current(&self) -> Health {
         self.loss_health.current()
+    }
+
+    /// Whether recent echoes are getting through at all — the authority on whether this
+    /// target is up, as distinct from how quickly it answers. Reads observed loss rather
+    /// than the windowed rate: "is anything coming back right now" must not be softened by
+    /// slots that were never probed.
+    pub fn is_answering(&self) -> bool {
+        !self.loss.is_empty() && self.loss.loss_pct() < 100.0
     }
 }
 
@@ -243,6 +257,13 @@ pub struct ThroughputState {
     /// Capacity-probe results over time. Kept apart from `rx_bps`/`tx_bps` because the
     /// probe runs on a minutes-long cadence and cannot share their per-second axis.
     pub capacity_mbps: Option<Series>,
+    /// When the last capacity reading was taken. The probe runs minutes apart and creates
+    /// its own traffic, so without an age the panel renders a stale synthetic burst beside
+    /// live counters and reads as a live statement about an idle link.
+    pub last_capacity_at: Option<DateTime<Utc>>,
+    /// The latest reading placed against what this link normally carries. `None` until
+    /// enough readings exist to have a normal at all.
+    pub baseline: Option<CapacityBaseline>,
     pub idle_latency_ms: Option<f64>,
     pub loaded_latency_ms: Option<f64>,
     /// Latency added under load, per bufferbloat measurement. History because bloat is
@@ -253,6 +274,15 @@ pub struct ThroughputState {
 }
 
 impl ThroughputState {
+    /// Current debounced capacity health (read by the diagnosis engine).
+    ///
+    /// Kept apart from [`Self::bufferbloat_health_current`] even though both land on one
+    /// border: a link too thin for the job and a link whose queues collapse under load are
+    /// different faults with different remedies, and the panel is the only place they merge.
+    pub fn capacity_health_current(&self) -> Health {
+        self.health.as_ref().map_or(Health::Ok, |d| d.current())
+    }
+
     /// Current debounced bufferbloat health (read by the diagnosis engine).
     pub fn bufferbloat_health_current(&self) -> Health {
         self.bufferbloat_health
@@ -300,12 +330,30 @@ impl InterfaceState {
 #[derive(Debug, Clone, Default)]
 pub struct RoutingState {
     pub hops: usize,
-    pub reachable: bool,
+    /// Whether the last trace terminated at the target.
+    pub reached_target: bool,
+    /// Whether ping vouched for the target being up when that trace ran. A trace that stops
+    /// short of a host that is answering echoes is an incomplete map, not an outage.
+    pub target_answering: bool,
     pub changed: bool,
     pub seen: bool,
     /// Per-hop detail from the last traceroute (address, best RTT, probe loss).
     pub detail: Vec<Hop>,
     health: Option<Debouncer>,
+}
+
+impl RoutingState {
+    /// Whether the target is reachable, as opposed to merely *traceable*. A trace that ends
+    /// short of a host still answering ICMP has mapped less of the path than it hoped, which
+    /// is a different thing from the path being down.
+    pub fn reachable(&self) -> bool {
+        self.reached_target || self.target_answering
+    }
+
+    /// The trace ran out of responding hops before the target, but the target is up.
+    pub fn path_incomplete(&self) -> bool {
+        !self.reached_target && self.target_answering
+    }
 }
 
 /// Minutes of history the availability strip retains — about one cell per column on the
@@ -365,6 +413,12 @@ pub struct AppState {
     pub mtu: Option<u32>,
     pub vpn: bool,
     pub events: VecDeque<Incident>,
+    /// The most recent timestamp the reducer was driven with — the render's clock.
+    ///
+    /// Panels must not read the wall clock themselves: they are tested against a fixed
+    /// state, and a panel calling `Utc::now()` renders differently on every frame of the
+    /// same input. Anything that has to age a reading ages it against this.
+    pub last_seen: Option<DateTime<Utc>>,
     pub max_events: usize,
     /// Instability bookkeeping, one entry per (metric, target) that has ever transitioned.
     /// A `BTreeMap` rather than a hash map so the settle incidents a single fold emits come
@@ -410,6 +464,7 @@ impl AppState {
             mtu: None,
             vpn: false,
             events: VecDeque::new(),
+            last_seen: None,
             max_events: 200,
             flaps: BTreeMap::new(),
             recent_alerts: BTreeMap::new(),
@@ -455,6 +510,7 @@ impl AppState {
     /// Fold one sample into state, returning any incidents produced by the update. Emitted
     /// incidents are also appended to the in-memory `events` ring.
     pub fn apply_sample(&mut self, now: DateTime<Utc>, sample: Sample) -> Vec<Incident> {
+        self.last_seen = Some(now);
         let mut incidents = match sample {
             Sample::Latency { target, rtt_ms } => self.apply_latency(now, &target, rtt_ms),
             Sample::Dns { resolver, answer } => self.apply_dns(now, &resolver, answer),
@@ -494,10 +550,10 @@ impl AppState {
             Sample::Routing {
                 target,
                 hops,
-                reachable,
+                reached_target,
                 changed,
                 detail,
-            } => self.apply_routing(now, &target, hops, reachable, changed, detail),
+            } => self.apply_routing(now, &target, hops, reached_target, changed, detail),
         };
         self.attribute(&mut incidents);
         let incidents = self.filter_noise(now, incidents);
@@ -653,6 +709,7 @@ impl AppState {
     /// would leave it empty under `--once`. Idempotent within a minute, so calling it at
     /// the render rate costs nothing but a worst-of merge.
     pub fn tick(&mut self, now: DateTime<Utc>) {
+        self.last_seen = Some(now);
         let Some(bucket) = now.with_second(0).and_then(|t| t.with_nanosecond(0)) else {
             return;
         };
@@ -719,6 +776,7 @@ impl AppState {
         let cfg = self.config.clone();
         let t = self.targets.get_mut(target).expect("just registered");
 
+        t.recent.record(rtt_ms);
         match rtt_ms {
             Some(rtt) => {
                 t.latency_ms.push(rtt);
@@ -730,35 +788,30 @@ impl AppState {
         let mut out = Vec::new();
 
         // Latency (uses gateway or internet thresholds depending on the target's role).
-        // A timed-out ping is a latency failure in its own right: evaluating the *stale*
-        // last-good RTT would keep reporting "healthy" straight through a total outage.
+        //
+        // Judged on the *typical* recent outcome rather than the packet that just landed.
+        // One slow echo is not a slow link, and classifying packets one at a time is how a
+        // Wi-Fi laptop came to report a permanent local-network fault that no other panel
+        // could corroborate. A timeout still counts, and counts as worse than any RTT: it
+        // outranks every measured value inside the window, so an outage cannot read as
+        // healthy on the strength of a stale last-good reply.
         let lat_thr = *t.latency_thresholds(&cfg);
-        match rtt_ms {
-            Some(rtt) => {
-                let raw = lat_thr.evaluate(rtt);
-                if let Some(sev) = t.latency_health.update(now, raw) {
-                    out.push(incident_for(
-                        now,
-                        MetricId::Latency,
-                        target,
-                        sev,
-                        rtt,
-                        "ms",
-                        &lat_thr,
-                    ));
-                }
-            }
-            None => {
-                if let Some(sev) = t.latency_health.update(now, Health::Crit) {
-                    out.push(status_incident(
-                        now,
-                        MetricId::Latency,
-                        target,
-                        sev,
-                        format!("latency probe timed out ({target})"),
-                    ));
-                }
-            }
+        let (raw, typical_ms) = match t.recent.typical() {
+            Typical::Unknown => (Health::Ok, None),
+            Typical::Rtt(ms) => (lat_thr.evaluate(ms), Some(ms)),
+            Typical::TimedOut => (Health::Crit, None),
+        };
+        if let Some(sev) = t.latency_health.update(now, raw) {
+            out.push(match typical_ms {
+                Some(ms) => incident_for(now, MetricId::Latency, target, sev, ms, "ms", &lat_thr),
+                None => status_incident(
+                    now,
+                    MetricId::Latency,
+                    target,
+                    sev,
+                    format!("latency probe timed out ({target})"),
+                ),
+            });
         }
 
         // Jitter (shares the Latency panel).
@@ -778,18 +831,19 @@ impl AppState {
             }
         }
 
-        // Loss.
+        // Loss. Charted as observed, but judged as a rate over the full window — see
+        // `LossWindow::rate_over_window` for why the two differ before it has filled.
         let loss_thr = cfg.thresholds.loss;
-        let loss_pct = t.loss.loss_pct();
-        t.loss_history.push(loss_pct);
-        let raw = loss_thr.evaluate(loss_pct);
+        t.loss_history.push(t.loss.loss_pct());
+        let loss_rate = t.loss.rate_over_window();
+        let raw = loss_thr.evaluate(loss_rate);
         if let Some(sev) = t.loss_health.update(now, raw) {
             out.push(incident_for(
                 now,
                 MetricId::Loss,
                 target,
                 sev,
-                loss_pct,
+                loss_rate,
                 "%",
                 &loss_thr,
             ));
@@ -1308,8 +1362,26 @@ impl AppState {
             .capacity_mbps
             .get_or_insert_with(|| Series::new(cfg.thresholds.history_len))
             .push(mbps);
-        let thr = cfg.thresholds.throughput;
-        let raw = thr.evaluate(mbps);
+        self.throughput.last_capacity_at = Some(now);
+        // Judged against what this link has demonstrated, never an absolute Mbps floor — a
+        // floor calls a steady small link critical forever and stays quiet when a fast one
+        // collapses. Until there is a baseline there is no verdict: the readings accumulate
+        // and the panel stays neutral rather than being compared against a guess.
+        let Some(base) = crate::metrics::throughput::capacity_baseline(
+            &self
+                .throughput
+                .capacity_mbps
+                .as_ref()
+                .map(|s| s.values())
+                .unwrap_or_default(),
+            cfg.thresholds.capacity_baseline_min,
+        ) else {
+            self.throughput.baseline = None;
+            return Vec::new();
+        };
+        self.throughput.baseline = Some(base);
+        let thr = cfg.thresholds.capacity_drop;
+        let raw = thr.evaluate(base.pct_of_typical);
         let health = self.throughput.health.get_or_insert_with(|| {
             Debouncer::new(
                 Health::Ok,
@@ -1324,12 +1396,12 @@ impl AppState {
                     MetricId::Throughput,
                     "probe",
                     Health::Ok,
-                    "throughput recovered".to_string(),
+                    "capacity recovered".to_string(),
                 )]
             }
             Some(sev) => {
                 // Report the bound actually crossed, so a crit incident doesn't quote the
-                // warn floor and read as a milder problem than it is.
+                // warn bound and read as a milder problem than it is.
                 let crossed = if sev == Health::Crit {
                     thr.crit
                 } else {
@@ -1340,9 +1412,14 @@ impl AppState {
                         now,
                         MetricId::Throughput,
                         sev,
-                        format!("throughput {mbps:.0}Mbps below floor"),
+                        // The baseline is the whole message. "40 Mbps" is not a fault
+                        // report; "40 Mbps where this link normally does 500" is.
+                        format!(
+                            "capacity {mbps:.0}Mbps — {:.0}% of the usual {:.0}Mbps",
+                            base.pct_of_typical, base.typical_mbps
+                        ),
                     )
-                    .with_value(mbps, "Mbps")
+                    .with_value(base.pct_of_typical, "%")
                     .with_threshold(crossed),
                 ]
             }
@@ -1415,22 +1492,37 @@ impl AppState {
         now: DateTime<Utc>,
         target: &str,
         hops: usize,
-        reachable: bool,
+        reached_target: bool,
         changed: bool,
         detail: Vec<Hop>,
     ) -> Vec<Incident> {
         let cfg = self.config.clone();
+        // Ping is the authority on whether the target is up; the trace is a map of how you
+        // get there. Anycast edges and filtered routers drop traceroute probes as a matter
+        // of policy while forwarding everything else, so a trace that stops short of a host
+        // whose echoes are coming back at 0% loss is an incomplete map — and calling that
+        // "unreachable" put the routing panel in direct contradiction with the loss panel.
+        let target_answering = self.targets.get(target).is_some_and(|t| t.is_answering());
         self.routing.hops = hops;
-        self.routing.reachable = reachable;
+        self.routing.reached_target = reached_target;
+        self.routing.target_answering = target_answering;
         self.routing.changed = changed;
         self.routing.detail = detail;
         self.routing.seen = true;
-        let raw = if !reachable {
+        let raw = if !self.routing.reachable() {
             Health::Crit
         } else if changed {
             Health::Warn
         } else {
             Health::Ok
+        };
+        let message = match raw {
+            Health::Crit => format!("route to {target} unreachable"),
+            Health::Warn => format!("route to {target} changed ({hops} hops)"),
+            Health::Ok if self.routing.path_incomplete() => {
+                format!("route to {target} stable ({hops} hops traced, target still answering)")
+            }
+            Health::Ok => format!("route to {target} stable ({hops} hops)"),
         };
         let health = self.routing.health.get_or_insert_with(|| {
             Debouncer::new(
@@ -1439,11 +1531,6 @@ impl AppState {
                 cfg.thresholds.clear_after(),
             )
         });
-        let message = match raw {
-            Health::Crit => format!("route to {target} unreachable"),
-            Health::Warn => format!("route to {target} changed ({hops} hops)"),
-            Health::Ok => format!("route to {target} stable ({hops} hops)"),
-        };
         match health.update(now, raw) {
             Some(sev) => vec![status_incident(
                 now,
@@ -1552,14 +1639,10 @@ impl AppState {
             ),
             // Capacity and bufferbloat share the Throughput panel: a link can be "up and
             // fast" yet unusable under load, so the border must reflect the worse of the two.
-            MetricId::Throughput | MetricId::Bufferbloat => {
-                let capacity = self
-                    .throughput
-                    .health
-                    .as_ref()
-                    .map_or(Health::Ok, |d| d.current());
-                capacity.worst(self.throughput.bufferbloat_health_current())
-            }
+            MetricId::Throughput | MetricId::Bufferbloat => self
+                .throughput
+                .capacity_health_current()
+                .worst(self.throughput.bufferbloat_health_current()),
             MetricId::Routing => self
                 .routing
                 .health
@@ -1765,6 +1848,10 @@ mod tests {
     /// The 1-second dwells pair with [`Clock`]: a change is committed by the second
     /// differing sample, which keeps these tests reading as "one blip is ignored, two in a
     /// row are believed".
+    ///
+    /// `latency_window = 1` makes the latency verdict read each packet on its own, which is
+    /// what these tests were written against. The real default judges the median of a short
+    /// window instead; [`spiky_config`] and the tests around it cover that.
     fn test_config() -> Config {
         let mut c = Config::default();
         c.targets.internet = vec!["1.1.1.1".into()];
@@ -1772,9 +1859,147 @@ mod tests {
         c.thresholds.trip_after_secs = 1.0;
         c.thresholds.clear_after_secs = 1.0;
         c.thresholds.loss_window = 4;
+        c.thresholds.latency_window = 1;
         c.thresholds.history_len = 16;
         c.thresholds.jitter = Thresholds::higher_is_worse(10_000.0, 20_000.0);
         c
+    }
+
+    /// Test config with the shipping latency window and dwells, for the behaviour that only
+    /// shows up over a run of packets: a link that spikes without being broken.
+    fn spiky_config() -> Config {
+        let mut c = test_config();
+        c.thresholds.latency_window = 10;
+        c.thresholds.trip_after_secs = 3.0;
+        c.thresholds.clear_after_secs = 15.0;
+        c.thresholds.loss_window = 60;
+        c.thresholds.history_len = 120;
+        c
+    }
+
+    /// Feed one RTT per second (or a timeout for `None`), returning every incident raised.
+    fn feed(s: &mut AppState, c: &mut Clock, rtts: &[Option<f64>]) -> Vec<Incident> {
+        let mut out = Vec::new();
+        for &rtt in rtts {
+            out.extend(s.apply_sample(
+                c.tick(),
+                Sample::Latency {
+                    target: "1.1.1.1".into(),
+                    rtt_ms: rtt,
+                },
+            ));
+        }
+        out
+    }
+
+    /// `good` quick replies followed by `bad` slow ones, repeated — a link that hitches
+    /// periodically without ever being broken. This is the shape a Wi-Fi laptop produces.
+    fn bursty(cycles: usize, good: usize, bad: usize) -> Vec<Option<f64>> {
+        let mut out = Vec::new();
+        for _ in 0..cycles {
+            out.extend(std::iter::repeat_n(Some(4.0), good));
+            out.extend(std::iter::repeat_n(Some(400.0), bad));
+        }
+        out
+    }
+
+    /// The report this fix came from: a link whose typical packet is 4 ms, which hitches for
+    /// a few seconds at a time, was reported as critically broken — and stayed that way,
+    /// because clearing needed a spike-free run longer than the gaps between hitches.
+    #[test]
+    fn a_link_that_hitches_in_bursts_is_not_reported_as_broken() {
+        let mut s = AppState::new(spiky_config());
+        let mut c = Clock::new();
+        let raised = feed(&mut s, &mut c, &bursty(8, 10, 4));
+        assert_eq!(
+            s.panel_health(MetricId::Latency),
+            Health::Ok,
+            "4 ms typical with periodic hitches is a working link: {raised:#?}"
+        );
+        assert!(
+            raised.is_empty(),
+            "and nothing to log about it: {raised:#?}"
+        );
+    }
+
+    /// The other half of the same bargain: smoothing must not swallow a link that is simply
+    /// slow. Every packet is bad here, so every reading of the window is too.
+    #[test]
+    fn a_sustained_slowdown_is_still_reported() {
+        let mut s = AppState::new(spiky_config());
+        let mut c = Clock::new();
+        let raised = feed(&mut s, &mut c, &vec![Some(400.0); 20]);
+        assert_eq!(s.panel_health(MetricId::Latency), Health::Crit);
+        assert_eq!(raised.len(), 1, "{raised:#?}");
+        assert_eq!(raised[0].severity, Health::Crit);
+    }
+
+    #[test]
+    fn a_total_outage_is_still_reported() {
+        let mut s = AppState::new(spiky_config());
+        let mut c = Clock::new();
+        feed(&mut s, &mut c, &vec![Some(4.0); 20]);
+        let raised = feed(&mut s, &mut c, &vec![None; 20]);
+        assert_eq!(s.panel_health(MetricId::Latency), Health::Crit);
+        assert!(
+            raised.iter().any(|i| i.severity == Health::Crit),
+            "a link with nothing coming back is not healthy: {raised:#?}"
+        );
+    }
+
+    /// A single dropped echo per window is what Wi-Fi does. It is not an outage, and the
+    /// window must not let one `None` outvote nine good replies.
+    #[test]
+    fn one_dropped_echo_among_many_is_not_an_outage() {
+        let mut s = AppState::new(spiky_config());
+        let mut c = Clock::new();
+        let mut seq = vec![Some(4.0); 30];
+        seq[7] = None;
+        let raised = feed(&mut s, &mut c, &seq);
+        assert_eq!(s.panel_health(MetricId::Latency), Health::Ok);
+        assert_eq!(
+            s.panel_health(MetricId::Loss),
+            Health::Ok,
+            "one loss in a 60-probe window is 1.7%, under the 2% warn bound — and it must \
+             read that way from the eighth probe, not just from the sixtieth: {raised:#?}"
+        );
+    }
+
+    /// The ratchet, end to end: once a real fault clears, a stray spike during the recovery
+    /// must not hold the panel red forever.
+    #[test]
+    fn a_recovered_link_goes_green_again_despite_a_stray_spike() {
+        let mut s = AppState::new(spiky_config());
+        let mut c = Clock::new();
+        feed(&mut s, &mut c, &vec![Some(400.0); 20]);
+        assert_eq!(s.panel_health(MetricId::Latency), Health::Crit);
+
+        // Healthy again, but with one spike part-way through the clear dwell.
+        let mut seq = vec![Some(4.0); 40];
+        seq[9] = Some(400.0);
+        let raised = feed(&mut s, &mut c, &seq);
+        assert_eq!(
+            s.panel_health(MetricId::Latency),
+            Health::Ok,
+            "one spike must not cancel a recovery: {raised:#?}"
+        );
+    }
+
+    /// The verdict is a property of the window, so the incident has to quote the window —
+    /// quoting the packet that happened to arrive last would name a number nothing was
+    /// judged against.
+    #[test]
+    fn a_latency_incident_reports_the_typical_rtt_not_the_last_packet() {
+        let mut s = AppState::new(spiky_config());
+        let mut c = Clock::new();
+        // Steady 400 ms, and the packet that happens to tip the dwell over is a 900 ms one.
+        let raised = feed(
+            &mut s,
+            &mut c,
+            &[Some(400.0), Some(400.0), Some(400.0), Some(900.0)],
+        );
+        let inc = raised.first().expect("a sustained slowdown is reported");
+        assert_eq!(inc.value, Some(400.0), "{inc:?}");
     }
 
     fn latency(target: &str, rtt: f64) -> Sample {
@@ -2972,7 +3197,11 @@ mod tests {
         );
         assert_eq!(wan[0].metric, MetricId::PublicIp, "{wan:#?}");
 
-        // Capacity keeps the generic id — it is what "throughput" has always meant.
+        // Capacity keeps the generic id — it is what "throughput" has always meant. It needs
+        // a baseline before it has an opinion, so establish one and then collapse it.
+        drive(&mut s, &mut c, 5, || Sample::ThroughputProbe {
+            mbps: 400.0,
+        });
         let cap = drive(&mut s, &mut c, 2, || Sample::ThroughputProbe { mbps: 0.5 });
         assert_eq!(cap[0].metric, MetricId::Throughput, "{cap:#?}");
     }
@@ -3105,9 +3334,9 @@ mod tests {
         c.targets.gateway = Some("gw".into());
         let mut s = AppState::new(c);
         let mut c = Clock::new();
-        // 20ms is Ok for internet (<80) but Warn for the gateway (>=15).
-        s.apply_sample(c.tick(), latency("gw", 20.0));
-        s.apply_sample(c.tick(), latency("gw", 21.0));
+        // 30ms is Ok for internet (<80) but Warn for the gateway (>=25).
+        s.apply_sample(c.tick(), latency("gw", 30.0));
+        s.apply_sample(c.tick(), latency("gw", 31.0));
         assert_eq!(s.targets["gw"].latency_health_current(), Health::Warn);
     }
 
@@ -3491,36 +3720,81 @@ mod tests {
         assert_eq!(s.throughput.tx_bps.as_ref().unwrap().latest(), Some(200.0));
     }
 
+    /// Feed a run of capacity readings, returning the incidents from the last one.
+    fn capacity_run(s: &mut AppState, c: &mut Clock, readings: &[f64]) -> Vec<Incident> {
+        let mut out = Vec::new();
+        for m in readings {
+            out = s.apply_sample(c.tick(), Sample::ThroughputProbe { mbps: *m });
+        }
+        out
+    }
+
+    // The fault is the collapse, not the absolute number. 500 Mbps of headroom gone is a
+    // real event on a link that has been delivering it all day.
     #[test]
-    fn throughput_probe_below_floor_warns() {
-        let mut c = test_config();
-        c.thresholds.throughput = Thresholds::lower_is_worse(100.0, 25.0);
-        let mut s = AppState::new(c);
+    fn capacity_collapsing_against_its_own_baseline_is_reported() {
+        let mut s = AppState::new(test_config());
         let mut c = Clock::new();
-        s.apply_sample(c.tick(), Sample::ThroughputProbe { mbps: 50.0 });
-        let out = s.apply_sample(c.tick(), Sample::ThroughputProbe { mbps: 40.0 });
-        assert_eq!(out.len(), 1);
-        assert_eq!(out[0].severity, Health::Warn);
-        assert_eq!(out[0].value, Some(40.0));
-        assert_eq!(out[0].threshold, Some(100.0));
-        assert_eq!(s.throughput.last_mbps, Some(40.0));
+        // Five readings to establish a normal, then two collapsed ones to trip the debounce.
+        capacity_run(&mut s, &mut c, &[500.0, 480.0, 510.0, 495.0, 505.0]);
+        let out = capacity_run(&mut s, &mut c, &[40.0, 38.0]);
+        assert_eq!(out.len(), 1, "{out:#?}");
+        assert_eq!(out[0].severity, Health::Crit);
+        assert_eq!(out[0].metric, MetricId::Throughput);
+        assert_eq!(s.panel_health(MetricId::Throughput), Health::Crit);
+        // The incident quotes the baseline, since the raw Mbps alone says nothing.
+        assert!(
+            out[0].message.contains("500") || out[0].message.contains("495"),
+            "the message should name what is normal for this link: {:?}",
+            out[0].message
+        );
+    }
+
+    // The whole reason for the baseline. This link is small and completely healthy; the old
+    // absolute floor called it critical every five minutes for as long as it stayed up.
+    #[test]
+    fn a_steady_small_link_never_alerts() {
+        let mut s = AppState::new(test_config());
+        let mut c = Clock::new();
+        let out = capacity_run(&mut s, &mut c, &[8.0, 7.6, 8.2, 7.9, 8.1, 7.8, 8.0, 7.7]);
+        assert!(out.is_empty(), "{out:#?}");
+        assert_eq!(s.panel_health(MetricId::Throughput), Health::Ok);
+    }
+
+    // A halving is worth a look; it is not an outage.
+    #[test]
+    fn a_halved_link_warns_rather_than_crits() {
+        let mut s = AppState::new(test_config());
+        let mut c = Clock::new();
+        capacity_run(&mut s, &mut c, &[400.0, 400.0, 400.0, 400.0, 400.0]);
+        let out = capacity_run(&mut s, &mut c, &[170.0, 165.0]);
+        assert_eq!(out.len(), 1, "{out:#?}");
+        assert_eq!(out[0].severity, Health::Warn, "{out:#?}");
+    }
+
+    // Warm-up. With nothing to compare against, the honest verdict is silence — otherwise
+    // the first reading after launch is judged against a baseline of itself.
+    #[test]
+    fn no_verdict_is_formed_before_the_baseline_exists() {
+        let mut s = AppState::new(test_config());
+        let mut c = Clock::new();
+        let out = capacity_run(&mut s, &mut c, &[400.0, 12.0]);
+        assert!(out.is_empty(), "{out:#?}");
+        assert_eq!(s.panel_health(MetricId::Throughput), Health::Ok);
+        // ...but the readings are still recorded, so the baseline can form.
+        assert_eq!(s.throughput.last_mbps, Some(12.0));
+        assert_eq!(s.throughput.capacity_mbps.as_ref().unwrap().len(), 2);
     }
 
     #[test]
-    fn throughput_far_below_floor_is_crit() {
-        let mut c = test_config();
-        c.thresholds.throughput = Thresholds::lower_is_worse(100.0, 25.0);
-        let mut s = AppState::new(c);
+    fn a_capacity_reading_records_when_it_was_taken() {
+        // The panel ages this: a five-minute-old burst rendered next to live counters
+        // otherwise reads as a statement about an idle link.
+        let mut s = AppState::new(test_config());
         let mut c = Clock::new();
-        // 4 Mbps on a link expected to do 100 is not a "warning", it is unusable.
-        s.apply_sample(c.tick(), Sample::ThroughputProbe { mbps: 5.0 });
-        let out = s.apply_sample(c.tick(), Sample::ThroughputProbe { mbps: 4.0 });
-        assert_eq!(out.len(), 1);
-        assert_eq!(out[0].severity, Health::Crit);
-        assert_eq!(out[0].value, Some(4.0));
-        // The reported threshold must be the one actually crossed, not the warn bound.
-        assert_eq!(out[0].threshold, Some(25.0));
-        assert_eq!(s.panel_health(MetricId::Throughput), Health::Crit);
+        let at = c.tick();
+        s.apply_sample(at, Sample::ThroughputProbe { mbps: 400.0 });
+        assert_eq!(s.throughput.last_capacity_at, Some(at));
     }
 
     #[test]
@@ -3559,7 +3833,7 @@ mod tests {
         let r = Sample::Routing {
             target: "1.1.1.1".into(),
             hops: 0,
-            reachable: false,
+            reached_target: false,
             changed: false,
             detail: vec![],
         };
@@ -3567,6 +3841,56 @@ mod tests {
         let out = s.apply_sample(c.tick(), r);
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].severity, Health::Crit);
+        assert_eq!(s.panel_health(MetricId::Routing), Health::Crit);
+    }
+
+    /// A trace that stops short has not proved anything is unreachable. The last hops of an
+    /// anycast path routinely drop traceroute's probes while forwarding everything else, so
+    /// a trace that ends at hop 9 while ICMP echo to the target comes back at 0% loss is an
+    /// incomplete *map*, not an outage — and reporting it as one contradicted the packet-loss
+    /// panel two columns over.
+    #[test]
+    fn a_trace_that_stops_short_of_a_target_that_is_answering_is_not_an_outage() {
+        let mut s = AppState::new(test_config());
+        let mut c = Clock::new();
+        for _ in 0..4 {
+            s.apply_sample(c.tick(), latency("1.1.1.1", 20.0));
+        }
+        let trace = Sample::Routing {
+            target: "1.1.1.1".into(),
+            hops: 9,
+            reached_target: false,
+            changed: false,
+            detail: vec![],
+        };
+        s.apply_sample(c.tick(), trace.clone());
+        let out = s.apply_sample(c.tick(), trace);
+        assert_eq!(
+            s.panel_health(MetricId::Routing),
+            Health::Ok,
+            "ping is the authority on reachability; the trace is a map: {out:#?}"
+        );
+        assert!(out.is_empty(), "and nothing to log about it: {out:#?}");
+    }
+
+    /// The other half: when the target has stopped answering too, the trace stopping short
+    /// is corroboration, and the route really is down.
+    #[test]
+    fn a_trace_that_stops_short_of_a_silent_target_is_still_an_outage() {
+        let mut s = AppState::new(test_config());
+        let mut c = Clock::new();
+        for _ in 0..4 {
+            s.apply_sample(c.tick(), timeout("1.1.1.1"));
+        }
+        let trace = Sample::Routing {
+            target: "1.1.1.1".into(),
+            hops: 3,
+            reached_target: false,
+            changed: false,
+            detail: vec![],
+        };
+        s.apply_sample(c.tick(), trace.clone());
+        s.apply_sample(c.tick(), trace);
         assert_eq!(s.panel_health(MetricId::Routing), Health::Crit);
     }
 
@@ -3579,7 +3903,7 @@ mod tests {
             Sample::Routing {
                 target: "t".into(),
                 hops: 8,
-                reachable: true,
+                reached_target: true,
                 changed: true,
                 detail: vec![],
             },
@@ -3589,7 +3913,7 @@ mod tests {
             Sample::Routing {
                 target: "t".into(),
                 hops: 9,
-                reachable: true,
+                reached_target: true,
                 changed: true,
                 detail: vec![],
             },

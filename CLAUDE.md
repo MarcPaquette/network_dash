@@ -123,5 +123,59 @@ probe tasks ── mpsc<Sample> ──▶ AppState (reducer) ──▶ ratatui r
 - Probe names must be **absolute** (trailing dot). A relative name picks up the OS search
   list, so a "does not exist" control name can resolve via a search domain and read as a
   hijack (`dns::absolute`).
+- **Judge the distribution, not the packet.** Wi-Fi power-save inflates idle 1 Hz ICMP RTT
+  in bursts that application traffic never feels, so a per-packet verdict paints a fine link
+  red several times an hour. Latency is read from `history::OutcomeWindow::typical` — the
+  median of the last `thresholds.latency_window` outcomes, timeouts sorting worst — so a lone
+  spike or a lone drop moves nothing while a sustained slowdown still trips. The three
+  questions stay decomposed: latency = "how slow normally" (median), jitter = "how erratic"
+  (mean absolute consecutive delta), loss = "how much is missing" (rate). A spiky link is
+  caught by jitter rather than mis-reported as slow.
+- Loss for the *verdict* is `LossWindow::rate_over_window` (over the whole window, unprobed
+  slots counted as answered); `loss_pct` (over probes actually taken) is what the panel
+  charts. A partly-filled window otherwise reports one drop as 9% and alerts in the first
+  minute after launch.
+- **A router slow to answer is not a router slow to forward.** Echo replies addressed to the
+  router come from its control plane — the slowest work it does. Measured here: ping avg
+  4.7 ms while traceroute hop 1 read 62.4 ms. `diagnosis.rs` will not blame the LAN on
+  gateway *latency* alone; it needs corroboration from something that crosses the gateway
+  (`gateway_loss`, `internet`, `transport`, `reach_bad`), which is why `Signals` splits
+  gateway loss out from the combined gateway verdict.
+- **A small link is not a broken one.** Capacity is judged against the link's *own* rolling
+  baseline (`throughput::capacity_baseline` — the median of the readings before the latest,
+  as a percentage, via `thresholds.capacity_drop`), never an absolute Mbps floor. A floor is
+  a spec check, not a fault detector: it answers "is this link fast?", which is a property of
+  the plan someone bought. The old 100/25 Mbps floor painted a steady 8 Mbps line critical
+  every five minutes forever and said nothing when a gigabit line fell to 30. Below
+  `capacity_baseline_min` readings there is **no verdict at all** — a link nobody has watched
+  long enough to have a normal cannot be said to have fallen below it.
+- **Say how old a reading is when the probe is slower than the frame.** The capacity probe
+  runs every 5 minutes and *generates its own traffic*. Rendered with no age beside live rx/tx
+  counters, a stale synthetic burst reads as a live statement about a link that is sitting
+  idle — which is how "capacity 7 Mbps, load +228ms" appeared next to 275 KB/s of real
+  traffic. `AppState.last_seen` is the render clock (panels must never call `Utc::now()`, or
+  the same state renders differently every frame); `history::compact_age` formats it.
+- **A slow server is not a slow link.** A capacity download has two phases and only one of
+  them measures the link: setup (DNS, TCP, TLS, and the server's think time before the first
+  body byte) is round trips carrying nothing. Measured here: 3 MB with 1.7–2.0 s of setup and
+  0.29–0.85 s of body — charging the whole thing reads 9–11 Mbps, under the 25 Mbps *crit*
+  floor, where the body alone reads 28–84 Mbps. `throughput::DownloadTiming` names the split
+  and `mbps()` divides by `body_secs` only.
+- **Don't measure the queue you're standing in.** The bufferbloat probe must not share a
+  connection with the download it is timing. One `reqwest::Client` means one pooled
+  connection, and with `http2` on, the latency requests multiplex onto the transfer's own
+  stream — head-of-line blocked behind its frames, inside its congestion window. Measured
+  here: shared client +107 ms and +1149 ms of "bloat" where two clients over the same link at
+  the same moment saw +0 ms and +18 ms. `CapacityProbe` keeps a separate `latency_client`; a
+  second connection still shares the bottleneck *link*, which is the thing under test.
+- **An incomplete trace is not an unreachable target.** Anycast edges and filtered routers
+  drop traceroute probes as policy while forwarding everything else. `Sample::Routing`
+  carries `reached_target` (a fact about the *trace*); `RoutingState::reachable()` also
+  weighs whether ping is getting through, and `path_incomplete()` renders as a muted
+  "incomplete (target answering)" rather than red "unreachable".
+- The `Debouncer` cancels asymmetrically: good news kills a pending *trip* instantly, but one
+  bad sample does not restart a pending *recovery* — the relapse must hold for `trip_after`
+  first. Otherwise a link spiking every few seconds never clears and ratchets to permanently
+  red.
 - Incident log path (macOS): `~/Library/Application Support/network_dash/incidents.jsonl`.
 - Keep probes lightweight (no active bandwidth flooding); that is a hard requirement.

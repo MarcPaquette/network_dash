@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::app::AppState;
 use crate::health::Health;
+use crate::history::compact_age;
 use crate::metrics::dns::Integrity;
 
 /// The network segment a fault localizes to.
@@ -84,6 +85,12 @@ pub struct Diagnosis {
 struct Signals {
     /// Worst health across gateway ping targets (`None` if no gateway is registered).
     gateway: Option<Health>,
+    /// Gateway *loss* on its own, split out from the combined verdict above. A router is
+    /// entitled to be slow answering pings addressed to itself — echo replies are generated
+    /// by its control plane, which is the slowest, most deprioritised thing it does — while
+    /// forwarding traffic through at full speed. Dropped echoes are the signal that the LAN
+    /// path itself is in trouble; a slow echo, alone, is not.
+    gateway_loss: Health,
     /// Worst health across internet (non-gateway) ping targets.
     internet: Health,
     /// Total / unhealthy internet target counts (to tell "one host" from "the whole ISP").
@@ -137,6 +144,21 @@ struct Signals {
     /// Bufferbloat: health and the added latency (ms) measured under load.
     bufferbloat: Health,
     bufferbloat_ms: Option<f64>,
+    /// Measured link capacity: health, the last reading, and what this link normally
+    /// carries. Kept apart from `bufferbloat` because the two share the throughput panel but
+    /// not a cause — a link can be thin and perfectly responsive, or fast and unusable the
+    /// moment it is loaded.
+    ///
+    /// The verdict is *relative*: `capacity_pct` is the latest reading as a percentage of
+    /// `capacity_typical_mbps`. An absolute Mbps number cannot distinguish a small link from
+    /// a broken one, and reporting the former as a fault is the loudest possible way to say
+    /// "this is normal".
+    capacity: Health,
+    capacity_mbps: Option<f64>,
+    capacity_typical_mbps: Option<f64>,
+    capacity_pct: Option<f64>,
+    /// How much wall-clock the baseline was drawn from, in seconds.
+    capacity_span_secs: Option<i64>,
 }
 
 impl Default for Signals {
@@ -144,6 +166,7 @@ impl Default for Signals {
     fn default() -> Self {
         Self {
             gateway: Some(Health::Ok),
+            gateway_loss: Health::Ok,
             internet: Health::Ok,
             internet_total: 2,
             internet_bad: 0,
@@ -173,6 +196,11 @@ impl Default for Signals {
             nic_error_count: None,
             bufferbloat: Health::Ok,
             bufferbloat_ms: None,
+            capacity: Health::Ok,
+            capacity_mbps: None,
+            capacity_typical_mbps: None,
+            capacity_pct: None,
+            capacity_span_secs: None,
         }
     }
 }
@@ -180,11 +208,15 @@ impl Default for Signals {
 impl Signals {
     /// Project the current [`AppState`] into a diagnosis snapshot.
     fn from_state(state: &AppState) -> Self {
-        // Gateway: worst of latency/loss across any gateway-flagged targets.
+        // Gateway: worst of latency/loss across any gateway-flagged targets, with loss also
+        // kept on its own — see the field docs for why the two are not interchangeable.
         let mut gateway: Option<Health> = None;
+        let mut gateway_loss = Health::Ok;
         for t in state.targets.values().filter(|t| t.is_gateway) {
-            let h = t.latency_health_current().worst(t.loss_health_current());
+            let loss = t.loss_health_current();
+            let h = t.latency_health_current().worst(loss);
             gateway = Some(gateway.map_or(h, |cur| cur.worst(h)));
+            gateway_loss = gateway_loss.worst(loss);
         }
 
         // Internet: worst over non-gateway targets, plus how many are unhealthy.
@@ -302,6 +334,7 @@ impl Signals {
 
         Self {
             gateway,
+            gateway_loss,
             internet,
             internet_total,
             internet_bad,
@@ -320,7 +353,7 @@ impl Signals {
             cert,
             cert_soonest,
             routing_seen: state.routing.seen,
-            routing_reachable: state.routing.reachable,
+            routing_reachable: state.routing.reachable(),
             wifi_signal,
             wifi_quality,
             rssi_dbm,
@@ -340,6 +373,14 @@ impl Signals {
                 (Some(i), Some(l)) => Some((l - i).max(0.0)),
                 _ => None,
             },
+            capacity: state.throughput.capacity_health_current(),
+            capacity_mbps: state.throughput.last_mbps,
+            capacity_typical_mbps: state.throughput.baseline.map(|b| b.typical_mbps),
+            capacity_pct: state.throughput.baseline.map(|b| b.pct_of_typical),
+            capacity_span_secs: state
+                .throughput
+                .baseline
+                .map(|b| b.samples as i64 * state.config.cadence.throughput_probe_ms as i64 / 1000),
         }
     }
 }
@@ -434,12 +475,37 @@ fn diagnose_signals(s: &Signals) -> Vec<Diagnosis> {
     }
 
     // 2. Gateway / LAN. Only when Wi-Fi looks fine, so a weak radio isn't reported twice.
+    //
+    // Blaming the LAN needs corroboration from something that actually *crosses* the
+    // gateway. An echo reply is generated by the router's control plane — the slowest work
+    // it does, and the first thing it deprioritises — so a router answering pings in 80ms
+    // while forwarding packets in 2ms is ordinary, not broken. Without a second witness we
+    // still report the reading (it is what the LATENCY panel shows, and the header has to
+    // agree with the diagnosis), but we report it for what it is.
     if gateway_unhealthy && wifi == Health::Ok {
+        let corroborated = s.gateway_loss > Health::Ok
+            || s.internet > Health::Ok
+            || s.transport > Health::Ok
+            || s.reach_bad > 0;
+        let (headline, evidence) = if corroborated {
+            (
+                "High latency/loss to your gateway — local network problem".to_string(),
+                vec!["gateway ping degraded".to_string()],
+            )
+        } else {
+            (
+                "Your router is slow to answer pings, but traffic through it is fine".to_string(),
+                vec![
+                    "gateway ping slow".to_string(),
+                    "no loss to the gateway, and nothing past it is degraded".to_string(),
+                ],
+            )
+        };
         out.push(Diagnosis {
             layer: Some(Layer::Gateway),
             severity: s.gateway.unwrap_or(Health::Crit),
-            headline: "High latency/loss to your gateway — local network problem".into(),
-            evidence: vec!["gateway ping degraded".into()],
+            headline,
+            evidence,
         });
     }
 
@@ -490,6 +556,36 @@ fn diagnose_signals(s: &Signals) -> Vec<Diagnosis> {
                 evidence: vec!["reachability checks all failing".into()],
             });
         }
+    }
+
+    // Capacity: the link is carrying a fraction of what it has repeatedly demonstrated.
+    // Reported on its own rather than folded into the bufferbloat rule beside it — they
+    // share the throughput panel, but "collapsed" and "collapses under load" send the user
+    // after different things, and a capacity crit outranks a bufferbloat warn, so leaving it
+    // unnamed is how the header ends up quoting the milder of the two faults it reacts to.
+    //
+    // The evidence always carries the baseline. "30 Mbps" is a fact about a link; "30 Mbps
+    // where this one normally does 410" is the only version of it that is a fault report.
+    if s.capacity > Health::Ok {
+        let mut evidence = Vec::new();
+        if let (Some(now), Some(typical)) = (s.capacity_mbps, s.capacity_typical_mbps) {
+            let span = s
+                .capacity_span_secs
+                .map(|secs| format!(" over the last {}", compact_age(secs)))
+                .unwrap_or_default();
+            evidence.push(format!(
+                "{now:.0} Mbps now vs {typical:.0} Mbps typical{span}"
+            ));
+        }
+        if let Some(pct) = s.capacity_pct {
+            evidence.push(format!("down {:.0}% from baseline", (100.0 - pct).max(0.0)));
+        }
+        out.push(Diagnosis {
+            layer: Some(Layer::Isp),
+            severity: s.capacity,
+            headline: "Link capacity has collapsed against its own baseline".into(),
+            evidence,
+        });
     }
 
     // Bufferbloat: latency balloons when the link is saturated (independent of gateway/ISP
@@ -750,6 +846,19 @@ mod tests {
                     resolver: "cloudflare".into(),
                     verdict: Integrity::Forged,
                 }],
+            ),
+            (
+                "a link that has collapsed against its own baseline",
+                // Enough readings to establish a normal, then the collapse. One reading
+                // could never trip it — there would be nothing to compare against.
+                vec![
+                    Sample::ThroughputProbe { mbps: 400.0 },
+                    Sample::ThroughputProbe { mbps: 410.0 },
+                    Sample::ThroughputProbe { mbps: 395.0 },
+                    Sample::ThroughputProbe { mbps: 405.0 },
+                    Sample::ThroughputProbe { mbps: 400.0 },
+                    Sample::ThroughputProbe { mbps: 20.0 },
+                ],
             ),
         ];
 
@@ -1049,6 +1158,126 @@ mod tests {
         };
         let t = top(&s);
         assert_eq!(t.layer, Some(Layer::Gateway));
+    }
+
+    /// The false positive this split exists for. A home router answers echoes addressed to
+    /// itself from its slowest, least-important code path, so idle ICMP to it can sit at
+    /// 80ms while every packet *through* it goes out in 2ms. Blaming "your local network"
+    /// on that evidence alone sent the user hunting a fault that wasn't there.
+    #[test]
+    fn a_router_slow_to_answer_pings_is_not_called_a_local_network_problem() {
+        let s = Signals {
+            gateway: Some(Health::Warn),
+            gateway_loss: Health::Ok,
+            ..healthy()
+        };
+        let t = top(&s);
+        assert_eq!(t.layer, Some(Layer::Gateway));
+        assert!(
+            !t.headline.to_lowercase().contains("local network problem"),
+            "nothing through the gateway corroborates a LAN fault: {}",
+            t.headline
+        );
+        assert!(
+            t.headline.to_lowercase().contains("forward")
+                || t.headline.to_lowercase().contains("through it"),
+            "say what is actually true — the router is slow to *answer*: {}",
+            t.headline
+        );
+        assert!(
+            t.evidence
+                .iter()
+                .any(|e| e.contains("no loss") || e.contains("traffic through")),
+            "the evidence should record what cleared the LAN: {:?}",
+            t.evidence
+        );
+    }
+
+    #[test]
+    fn gateway_trouble_corroborated_by_loss_still_blames_the_lan() {
+        let s = Signals {
+            gateway: Some(Health::Crit),
+            gateway_loss: Health::Crit,
+            ..healthy()
+        };
+        let t = top(&s);
+        assert_eq!(t.layer, Some(Layer::Gateway));
+        assert!(
+            t.headline.to_lowercase().contains("local network problem"),
+            "dropped echoes to the router are a real LAN fault: {}",
+            t.headline
+        );
+    }
+
+    #[test]
+    fn gateway_trouble_corroborated_downstream_still_blames_the_lan() {
+        // Slow to answer *and* everything past it is degraded: now the gateway is the
+        // simplest explanation for both, which is exactly what this rule is for.
+        let s = Signals {
+            gateway: Some(Health::Warn),
+            gateway_loss: Health::Ok,
+            internet: Health::Warn,
+            internet_total: 2,
+            internet_bad: 2,
+            ..healthy()
+        };
+        let t = top(&s);
+        assert_eq!(t.layer, Some(Layer::Gateway));
+        assert!(
+            t.headline.to_lowercase().contains("local network problem"),
+            "corroborated by the path beyond it: {}",
+            t.headline
+        );
+    }
+
+    // A link carrying a fraction of what it normally does is a fault in its own right.
+    // Without a rule the throughput panel goes red for it — and so does the header, since a
+    // capacity crit outranks the bufferbloat warn sharing that panel — while the diagnosis
+    // below names only the milder of the two and the crit goes entirely unexplained.
+    #[test]
+    fn a_collapsed_link_is_explained_rather_than_left_to_the_header() {
+        let s = Signals {
+            capacity: Health::Crit,
+            capacity_mbps: Some(30.0),
+            capacity_typical_mbps: Some(410.0),
+            capacity_pct: Some(7.3),
+            capacity_span_secs: Some(7_200),
+            ..healthy()
+        };
+        let t = top(&s);
+        assert_eq!(t.layer, Some(Layer::Isp));
+        assert_eq!(t.severity, Health::Crit);
+        // The baseline is the point: the raw Mbps alone cannot tell a small link from a
+        // broken one, so the verdict has to carry both numbers.
+        let ev = t.evidence.join(" | ");
+        assert!(ev.contains("30"), "the current reading: {ev}");
+        assert!(ev.contains("410"), "what is normal for this link: {ev}");
+        assert!(ev.contains("2h"), "the window the baseline came from: {ev}");
+        assert!(ev.contains("93%"), "how far it has fallen: {ev}");
+    }
+
+    // Slow and bloated are different faults with different remedies — a link too thin for
+    // the job vs. one whose queues collapse the moment it is used. Collapsing them into one
+    // verdict would send the user after the wrong one.
+    #[test]
+    fn a_thin_link_and_a_bloated_one_are_reported_separately() {
+        let s = Signals {
+            capacity: Health::Crit,
+            capacity_mbps: Some(7.0),
+            bufferbloat: Health::Warn,
+            bufferbloat_ms: Some(228.0),
+            ..healthy()
+        };
+        let d = diagnose_signals(&s);
+        assert_eq!(d.len(), 2, "{d:#?}");
+        // Worst-first: the capacity crit outranks the bufferbloat warn, so the header
+        // headline is the one that actually earned the ✖.
+        assert_eq!(d[0].severity, Health::Crit);
+        assert!(d[0].headline.to_lowercase().contains("capacity"), "{d:#?}");
+        assert!(
+            d[1].headline.to_lowercase().contains("bufferbloat"),
+            "{d:#?}"
+        );
     }
 
     #[test]
